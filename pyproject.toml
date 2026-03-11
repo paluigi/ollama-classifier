@@ -1,0 +1,24 @@
+[project]
+name = "ollama-classifier"
+version = "0.1.0"
+description = "A wrapper around Ollama Python SDK for text classification with constrained output and confidence scoring"
+readme = "README.md"
+authors = [
+    { name = "Luigi Palumbo", email = "paluigi@gmail.com" },
+    {name = "Mengting Yu", email = "mengting.yu@unitus.it"}
+]
+requires-python = ">=3.11"
+dependencies = [
+    "ollama>=0.4.0",
+]
+
+[project.optional-dependencies]
+docs = [
+    "sphinx>=7.0.0",
+    "sphinx-rtd-theme>=2.0.0",
+    "myst-parser>=2.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"

@@ -1,0 +1,18 @@
+name: Publish to ReadTheDocs
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  trigger-rtd-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger ReadTheDocs build
+        run: |
+          VERSION=${{ github.event.release.tag_name }}
+          curl -X POST \
+            -H "Authorization: Token ${{ secrets.RTD_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            https://readthedocs.org/api/v3/projects/ollama-classifier/versions/$VERSION/builds/
