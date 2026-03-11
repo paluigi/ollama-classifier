@@ -75,8 +75,7 @@ class OllamaClassifier:
             options={"temperature": 0.0},
         )
         
-        content = response.get("message", {}).get("content", "{}")
-        result = json.loads(content)
+        result = json.loads(response.message.content)
         return result.get("label", "")
     
     def batch_generate(
@@ -140,8 +139,7 @@ class OllamaClassifier:
         )
         
         # Extract prediction from response
-        content = response.get("message", {}).get("content", "{}")
-        result = json.loads(content)
+        result = json.loads(response.message.content)
         prediction = result.get("label", "")
         
         # Extract logprobs from token distribution
@@ -369,8 +367,7 @@ class OllamaClassifier:
             options={"temperature": 0.0},
         )
         
-        content = response.get("message", {}).get("content", "{}")
-        result = json.loads(content)
+        result = json.loads(response.message.content)
         return result.get("label", "")
     
     async def abatch_generate(
@@ -437,8 +434,7 @@ class OllamaClassifier:
         )
         
         # Extract prediction from response
-        content = response.get("message", {}).get("content", "{}")
-        result = json.loads(content)
+        result = json.loads(response.message.content)
         prediction = result.get("label", "")
         
         # Extract logprobs from token distribution
@@ -651,100 +647,167 @@ class OllamaClassifier:
     # =========================================================================
     # Private Helper Methods
     # =========================================================================
-    
+
     def _extract_probabilities_from_logprobs(
         self,
-        response: Dict[str, Any],
+        response: Any,
         labels: List[str],
     ) -> Dict[str, float]:
         """Extract probabilities from logprobs in the response.
-        
-        Looks for the decision token in the logprobs and extracts
-        the probability distribution for the valid choices.
-        
+
+        Locates the token position where the label value begins in the generated
+        JSON output, then walks forward position by position accumulating the
+        log-probability for each label until every label has been fully resolved.
+        At each position the best-matching token for each label is looked up in
+        ``top_logprobs``; its logprob is added to that label's running score and
+        the matched character count is advanced.  This continues until all labels
+        are fully consumed, ensuring that labels sharing a long common prefix are
+        always unambiguously distinguished.
+
         Args:
-            response: The raw API response.
+            response: The raw ChatResponse object returned by the Ollama client.
             labels: List of valid choice labels.
-            
+
         Returns:
-            Dict mapping choice labels to probabilities.
+            Dict mapping choice labels to probabilities (summing to 1.0).
         """
-        # Initialize with zero logprobs
-        choice_logprobs: Dict[str, float] = {label: float("-inf") for label in labels}
-        
-        # Navigate the logprobs payload to find the decision token
-        logprobs_data = response.get("logprobs", [])
-        
+        logprobs_data = response.logprobs  # List[Logprob] | None
+
         if not logprobs_data:
-            # No logprobs available, return uniform distribution
+            # No logprobs available – return uniform distribution
             return {label: 1.0 / len(labels) for label in labels}
-        
-        for token_data in logprobs_data:
-            # Check if this is a dict or list format
-            if isinstance(token_data, dict):
-                top_candidates = token_data.get("top_logprobs", [])
-            elif isinstance(token_data, (list, tuple)) and len(token_data) > 0:
-                # Might be in different format
-                top_candidates = token_data if isinstance(token_data[0], dict) else []
-            else:
-                continue
-            
-            found_decision_token = False
-            
-            for candidate in top_candidates:
-                if isinstance(candidate, dict):
-                    token = candidate.get("token", "")
-                    # Normalize the token
-                    clean_token = token.strip(' \n\r\t"\'').lower()
-                    
-                    # Check if this matches any of our labels
-                    for label in labels:
-                        if label.lower() == clean_token or clean_token in label.lower():
-                            logprob = candidate.get("logprob", float("-inf"))
-                            if logprob > choice_logprobs[label]:
-                                choice_logprobs[label] = logprob
-                            found_decision_token = True
-            
-            if found_decision_token:
+
+        # ------------------------------------------------------------------
+        # Step 1: find the start position.
+        #
+        # The model generates JSON of the form `{ "label": "CHOICE" }`.
+        # We scan for the first token whose text (stripped of surrounding
+        # spaces and quote characters) is a non-empty prefix of at least one
+        # label.  For the example above this lands on the token `b` (start of
+        # "bullish"), skipping the structural tokens `{`, ` "`, `label`, `":`,
+        # and ` "`.
+        # ------------------------------------------------------------------
+        start_idx: int | None = None
+        for i, lp in enumerate(logprobs_data):
+            clean = lp.token.strip(' "\n\r\t')
+            if clean and any(
+                label.lower().startswith(clean.lower()) for label in labels
+            ):
+                start_idx = i
                 break
-        
-        # Apply softmax to convert logprobs to probabilities
-        return self._softmax(choice_logprobs)
-    
+
+        if start_idx is None:
+            # Could not locate the decision point – fall back to uniform
+            return {label: 1.0 / len(labels) for label in labels}
+
+        # ------------------------------------------------------------------
+        # Step 2: walk forward from start_idx accumulating per-label scores.
+        #
+        # For each label we track:
+        #   - ``consumed``: how many characters of the label have been matched
+        #   - ``score``:    sum of logprobs of matched tokens (starts at 0.0)
+        #
+        # At every position we build a token→logprob lookup from top_logprobs
+        # (plus the actually-generated token, which may be absent from the
+        # top list).  For each still-unresolved label we find the longest
+        # token in that lookup whose stripped text is a prefix of the label's
+        # remaining characters, add its logprob to the label's score, and
+        # advance ``consumed`` accordingly.
+        #
+        # We stop as soon as every label has been fully consumed, or when we
+        # run out of token positions.
+        # ------------------------------------------------------------------
+        label_score: Dict[str, float] = {label: 0.0 for label in labels}
+        label_consumed: Dict[str, int] = {label: 0 for label in labels}
+
+        for i in range(start_idx, len(logprobs_data)):
+            lp = logprobs_data[i]
+
+            # Build token → logprob map; ensure the generated token is present
+            token_map: Dict[str, float] = {
+                t.token: t.logprob for t in (lp.top_logprobs or [])
+            }
+            token_map[lp.token] = lp.logprob
+
+            all_done = True
+            for label in labels:
+                consumed = label_consumed[label]
+                if consumed >= len(label):
+                    continue  # this label is already fully matched
+                all_done = False
+
+                remaining = label[consumed:]  # characters yet to be matched
+
+                # Find the longest token in token_map that is a prefix of
+                # `remaining` (case-insensitive after stripping whitespace and
+                # quote characters).
+                best_logprob: float = float("-inf")
+                best_len: int = 0
+
+                for token, logprob in token_map.items():
+                    clean_token = token.strip(' "\n\r\t')
+                    if not clean_token:
+                        continue
+                    if remaining.lower().startswith(clean_token.lower()):
+                        if len(clean_token) > best_len:
+                            best_logprob = logprob
+                            best_len = len(clean_token)
+
+                if best_len > 0:
+                    label_score[label] += best_logprob
+                    label_consumed[label] += best_len
+
+            if all_done:
+                break
+
+        # Apply softmax to convert accumulated log-scores to probabilities
+        return self._softmax(label_score)
+
     def _get_choice_logprob(
         self,
         system: str,
         user: str,
         choice: str,
     ) -> float:
-        """Compute log P(choice | context) for a single choice.
-        
-        Appends the choice as assistant response and measures
-        how "expected" those tokens were.
-        
+        """Compute a log-probability score for a single choice.
+
+        Generates a response with a single-value schema that forces the model
+        to output ``choice`` and returns the sum of logprobs of all generated
+        tokens.  This gives a score proportional to how naturally the model
+        produces that choice given the context; applying softmax across all
+        choices yields calibrated probabilities.
+
         Args:
             system: System prompt.
             user: User prompt.
             choice: The choice label to evaluate.
-            
+
         Returns:
-            Log probability of the choice given the context.
+            Sum of token logprobs for the forced-choice generation.
         """
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": json.dumps({"label": choice})},
-        ]
-        
+        forced_schema = {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "enum": [choice]},
+            },
+            "required": ["label"],
+        }
+
         response = self._client.chat(
             model=self._model,
-            messages=messages,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            format=forced_schema,
             logprobs=True,
-            options={"num_predict": 0},
+            options={"temperature": 0.0},
         )
-        
-        return self._extract_logprob_from_response(response)
-    
+
+        if response.logprobs:
+            return sum(lp.logprob for lp in response.logprobs)
+        return 0.0
+
     async def _aget_choice_logprob(
         self,
         system: str,
@@ -752,70 +815,40 @@ class OllamaClassifier:
         choice: str,
     ) -> float:
         """Async version of _get_choice_logprob().
-        
-        Compute log P(choice | context) for a single choice.
-        
+
+        Compute a log-probability score for a single choice.
+
         Args:
             system: System prompt.
             user: User prompt.
             choice: The choice label to evaluate.
-            
+
         Returns:
-            Log probability of the choice given the context.
+            Sum of token logprobs for the forced-choice generation.
         """
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": json.dumps({"label": choice})},
-        ]
-        
+        forced_schema = {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "enum": [choice]},
+            },
+            "required": ["label"],
+        }
+
         response = await self._client.chat(
             model=self._model,
-            messages=messages,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            format=forced_schema,
             logprobs=True,
-            options={"num_predict": 0},
+            options={"temperature": 0.0},
         )
-        
-        return self._extract_logprob_from_response(response)
-    
-    def _extract_logprob_from_response(self, response: Dict[str, Any]) -> float:
-        """Extract log probability from Ollama response.
-        
-        Tries various fields where Ollama might return logprobs.
-        
-        Args:
-            response: The raw API response.
-            
-        Returns:
-            Extracted log probability, or 0.0 if not found.
-        """
-        msg = response.get("message", {})
-        
-        # Field: message.logprob (most common in newer versions)
-        if "logprob" in msg:
-            return msg["logprob"]
-        
-        # Field: eval_prob
-        if "eval_prob" in response:
-            p = response["eval_prob"]
-            return math.log(p) if p > 0 else float("-inf")
-        
-        # Field: logprobs list
-        if "logprobs" in msg:
-            lp = msg["logprobs"]
-            if isinstance(lp, list) and lp:
-                # Sum or average the logprobs
-                return sum(lp) / len(lp)
-        
-        # Check in response logprobs
-        logprobs = response.get("logprobs", [])
-        if logprobs and isinstance(logprobs, list):
-            # Try to extract from first token's logprob
-            if isinstance(logprobs[0], dict) and "logprob" in logprobs[0]:
-                return logprobs[0]["logprob"]
-        
-        return 0.0  # Default neutral
-    
+
+        if response.logprobs:
+            return sum(lp.logprob for lp in response.logprobs)
+        return 0.0
+
     def _softmax(self, logprobs: Dict[str, float]) -> Dict[str, float]:
         """Apply numerically stable softmax to log probabilities.
         
