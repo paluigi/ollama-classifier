@@ -247,16 +247,16 @@ class OllamaClassifier:
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Classify text with constrained generation and fast scoring.
-        
-        Combines generate() and score_fast() for a single classification
-        with confidence scores.
-        
+        """Classify text using fast single-call scoring.
+
+        Calls score_fast(), which uses constrained JSON generation and extracts
+        probabilities from the token logprobs in the same call.
+
         Args:
             text: The text to classify.
             choices: Either a list of choice labels, or a dict mapping labels to descriptions.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
@@ -545,14 +545,14 @@ class OllamaClassifier:
         system_prompt: str | None = None,
     ) -> ClassificationResult:
         """Async version of classify().
-        
-        Classify text with constrained generation and fast scoring.
-        
+
+        Classify text using fast single-call scoring (see score_fast).
+
         Args:
             text: The text to classify.
             choices: Either a list of choice labels, or a dict mapping labels to descriptions.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
