@@ -247,16 +247,16 @@ class OllamaClassifier:
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Classify text with constrained generation and fast scoring.
-        
-        Combines generate() and score_fast() for a single classification
-        with confidence scores.
-        
+        """Classify text using fast single-call scoring.
+
+        Calls score_fast(), which uses constrained JSON generation and extracts
+        probabilities from the token logprobs in the same call.
+
         Args:
             text: The text to classify.
             choices: Either a list of choice labels, or a dict mapping labels to descriptions.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
@@ -268,30 +268,20 @@ class OllamaClassifier:
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Classify text with constrained generation and complete scoring.
-        
-        Combines generate() and score_complete() for accurate classification
-        with calibrated confidence scores.
-        
+        """Classify text with complete scoring (N API calls, calibrated probabilities).
+
+        Uses score_complete() which makes one forced-choice API call per label,
+        then picks the highest-probability label as the prediction.
+
         Args:
             text: The text to classify.
             choices: Either a list of choice labels, or a dict mapping labels to descriptions.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
-        # Use generate for constrained prediction
-        prediction = self.generate(text, choices, system_prompt)
-        
-        # Use score_complete for probabilities
-        result = self.score_complete(text, choices, system_prompt)
-        
-        # Override prediction with constrained output
-        result.prediction = prediction
-        result.confidence = result.probabilities.get(prediction, 0.0)
-        
-        return result
+        return self.score_complete(text, choices, system_prompt)
     
     def batch_classify(
         self,
@@ -555,14 +545,14 @@ class OllamaClassifier:
         system_prompt: str | None = None,
     ) -> ClassificationResult:
         """Async version of classify().
-        
-        Classify text with constrained generation and fast scoring.
-        
+
+        Classify text using fast single-call scoring (see score_fast).
+
         Args:
             text: The text to classify.
             choices: Either a list of choice labels, or a dict mapping labels to descriptions.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
@@ -575,28 +565,19 @@ class OllamaClassifier:
         system_prompt: str | None = None,
     ) -> ClassificationResult:
         """Async version of classify_complete().
-        
-        Classify text with constrained generation and complete scoring.
-        
+
+        Classify text with complete scoring (N concurrent API calls, calibrated
+        probabilities). Picks the highest-probability label as the prediction.
+
         Args:
             text: The text to classify.
             choices: Either a list of choice labels, or a dict mapping labels to descriptions.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
-        # Use generate for constrained prediction
-        prediction = await self.agenerate(text, choices, system_prompt)
-        
-        # Use score_complete for probabilities
-        result = await self.ascore_complete(text, choices, system_prompt)
-        
-        # Override prediction with constrained output
-        result.prediction = prediction
-        result.confidence = result.probabilities.get(prediction, 0.0)
-        
-        return result
+        return await self.ascore_complete(text, choices, system_prompt)
     
     async def abatch_classify(
         self,
@@ -719,6 +700,7 @@ class OllamaClassifier:
         # ------------------------------------------------------------------
         label_score: Dict[str, float] = {label: 0.0 for label in labels}
         label_consumed: Dict[str, int] = {label: 0 for label in labels}
+        label_matched: Dict[str, bool] = {label: False for label in labels}
 
         for i in range(start_idx, len(logprobs_data)):
             lp = logprobs_data[i]
@@ -755,10 +737,17 @@ class OllamaClassifier:
 
                 if best_len > 0:
                     label_score[label] += best_logprob
+                    label_matched[label] = True
                     label_consumed[label] += best_len
 
             if all_done:
                 break
+
+        # Labels that never matched any token get -inf so softmax assigns them
+        # zero probability rather than the spuriously high weight of exp(0).
+        for label in labels:
+            if not label_matched[label]:
+                label_score[label] = float("-inf")
 
         # Apply softmax to convert accumulated log-scores to probabilities
         return self._softmax(label_score)
