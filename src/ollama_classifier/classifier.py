@@ -268,30 +268,20 @@ class OllamaClassifier:
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Classify text with constrained generation and complete scoring.
-        
-        Combines generate() and score_complete() for accurate classification
-        with calibrated confidence scores.
-        
+        """Classify text with complete scoring (N API calls, calibrated probabilities).
+
+        Uses score_complete() which makes one forced-choice API call per label,
+        then picks the highest-probability label as the prediction.
+
         Args:
             text: The text to classify.
             choices: Either a list of choice labels, or a dict mapping labels to descriptions.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
-        # Use generate for constrained prediction
-        prediction = self.generate(text, choices, system_prompt)
-        
-        # Use score_complete for probabilities
-        result = self.score_complete(text, choices, system_prompt)
-        
-        # Override prediction with constrained output
-        result.prediction = prediction
-        result.confidence = result.probabilities.get(prediction, 0.0)
-        
-        return result
+        return self.score_complete(text, choices, system_prompt)
     
     def batch_classify(
         self,
@@ -575,28 +565,19 @@ class OllamaClassifier:
         system_prompt: str | None = None,
     ) -> ClassificationResult:
         """Async version of classify_complete().
-        
-        Classify text with constrained generation and complete scoring.
-        
+
+        Classify text with complete scoring (N concurrent API calls, calibrated
+        probabilities). Picks the highest-probability label as the prediction.
+
         Args:
             text: The text to classify.
             choices: Either a list of choice labels, or a dict mapping labels to descriptions.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
-        # Use generate for constrained prediction
-        prediction = await self.agenerate(text, choices, system_prompt)
-        
-        # Use score_complete for probabilities
-        result = await self.ascore_complete(text, choices, system_prompt)
-        
-        # Override prediction with constrained output
-        result.prediction = prediction
-        result.confidence = result.probabilities.get(prediction, 0.0)
-        
-        return result
+        return await self.ascore_complete(text, choices, system_prompt)
     
     async def abatch_classify(
         self,
