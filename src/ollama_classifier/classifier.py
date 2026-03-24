@@ -719,6 +719,7 @@ class OllamaClassifier:
         # ------------------------------------------------------------------
         label_score: Dict[str, float] = {label: 0.0 for label in labels}
         label_consumed: Dict[str, int] = {label: 0 for label in labels}
+        label_matched: Dict[str, bool] = {label: False for label in labels}
 
         for i in range(start_idx, len(logprobs_data)):
             lp = logprobs_data[i]
@@ -755,10 +756,17 @@ class OllamaClassifier:
 
                 if best_len > 0:
                     label_score[label] += best_logprob
+                    label_matched[label] = True
                     label_consumed[label] += best_len
 
             if all_done:
                 break
+
+        # Labels that never matched any token get -inf so softmax assigns them
+        # zero probability rather than the spuriously high weight of exp(0).
+        for label in labels:
+            if not label_matched[label]:
+                label_score[label] = float("-inf")
 
         # Apply softmax to convert accumulated log-scores to probabilities
         return self._softmax(label_score)
