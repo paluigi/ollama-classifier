@@ -57,29 +57,15 @@ Override the default system prompt for specialized tasks:
                      "Classify financial news based on market sentiment."
    )
 
-Scoring Methods
----------------
+Scoring (Multi-Call with Softmax)
+---------------------------------
 
-Fast Scoring (Single API Call)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Use when you need confidence scores but speed is important:
+Get calibrated probability distribution over all choices.
+Makes N API calls for N choices:
 
 .. code-block:: python
 
-   result = classifier.score_fast(
-       text="The movie was fantastic!",
-       choices=["positive", "negative", "neutral"]
-   )
-
-Complete Scoring (Multi-Call with Softmax)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-More accurate but makes N API calls for N choices:
-
-.. code-block:: python
-
-   result = classifier.score_complete(
+   result = classifier.score(
        text="The movie was fantastic!",
        choices=["positive", "negative", "neutral"]
    )
@@ -109,14 +95,7 @@ Classify multiple texts efficiently:
        "The new smartphone features a revolutionary camera.",
    ]
 
-   # Fast batch classification
    results = classifier.batch_classify(
-       texts=texts,
-       choices=["sports", "finance", "technology"]
-   )
-
-   # Complete batch classification (more accurate)
-   results = classifier.batch_classify_complete(
        texts=texts,
        choices=["sports", "finance", "technology"]
    )

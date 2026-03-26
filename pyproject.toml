@@ -1,11 +1,12 @@
 [project]
 name = "ollama-classifier"
-version = "0.1.1"
+version = "0.2.0"
 description = "A wrapper around Ollama Python SDK for text classification with constrained output and confidence scoring"
 readme = "README.md"
 authors = [
-    { name = "Luigi Palumbo", email = "paluigi@gmail.com" },
-    {name = "Mengting Yu", email = "mengting.yu@unitus.it"}
+    {name = "Luigi Palumbo"},
+    {name = "Mengting Yu"},
+    {name = "Carolina Camassa"},
 ]
 requires-python = ">=3.11"
 dependencies = [

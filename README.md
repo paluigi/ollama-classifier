@@ -5,9 +5,7 @@ A Python wrapper around the Ollama Python SDK for text classification with const
 ## Features
 
 - **Constrained Output**: Uses JSON schema with enum constraints to ensure only valid choices are generated
-- **Confidence Scoring**: Two methods available:
-  - **Fast**: Single API call with logprob extraction
-  - **Complete**: Multi-call evaluation with softmax for calibrated probabilities
+- **Confidence Scoring**: Multi-call evaluation with softmax for calibrated probabilities
 - **Sync & Async**: Full support for both synchronous and asynchronous operations
 - **Batch Processing**: Classify multiple texts efficiently
 - **Flexible Choices**: Support for simple labels or labels with descriptions
@@ -95,23 +93,12 @@ result = classifier.classify(
 )
 ```
 
-### Scoring Methods
+### Scoring (Multi-Call with Softmax)
 
-#### Fast Scoring (Single API Call)
-
-```python
-result = classifier.score_fast(
-    text="The movie was fantastic!",
-    choices=["positive", "negative", "neutral"]
-)
-```
-
-#### Complete Scoring (Multi-Call with Softmax)
-
-More accurate but makes N API calls for N choices:
+Get calibrated probability distribution over all choices. Makes N API calls for N choices:
 
 ```python
-result = classifier.score_complete(
+result = classifier.score(
     text="The movie was fantastic!",
     choices=["positive", "negative", "neutral"]
 )
@@ -137,14 +124,7 @@ texts = [
     "The new smartphone features a revolutionary camera.",
 ]
 
-# Fast batch classification
 results = classifier.batch_classify(
-    texts=texts,
-    choices=["sports", "finance", "technology"]
-)
-
-# Complete batch classification (more accurate)
-results = classifier.batch_classify_complete(
     texts=texts,
     choices=["sports", "finance", "technology"]
 )
@@ -197,15 +177,11 @@ class ClassificationResult:
 | Method | Async | Description |
 |--------|-------|-------------|
 | `generate(text, choices, system_prompt)` | `agenerate` | Constrained output only (fastest) |
-| `score_fast(text, choices, system_prompt)` | `ascore_fast` | Single-call logprob extraction |
-| `score_complete(text, choices, system_prompt)` | `ascore_complete` | Multi-call evaluation with softmax |
-| `classify(text, choices, system_prompt)` | `aclassify` | Generate + score_fast |
-| `classify_complete(text, choices, system_prompt)` | `aclassify_complete` | Generate + score_complete |
+| `score(text, choices, system_prompt)` | `ascore` | Multi-call evaluation with softmax |
+| `classify(text, choices, system_prompt)` | `aclassify` | Full classification with confidence scores |
 | `batch_generate(texts, choices, system_prompt)` | `abatch_generate` | Batch constrained output |
-| `batch_score_fast(texts, choices, system_prompt)` | `abatch_score_fast` | Batch fast scoring |
-| `batch_score_complete(texts, choices, system_prompt)` | `abatch_score_complete` | Batch complete scoring |
-| `batch_classify(texts, choices, system_prompt)` | `abatch_classify` | Batch classify (fast) |
-| `batch_classify_complete(texts, choices, system_prompt)` | `abatch_classify_complete` | Batch classify (complete) |
+| `batch_score(texts, choices, system_prompt)` | `abatch_score` | Batch scoring |
+| `batch_classify(texts, choices, system_prompt)` | `abatch_classify` | Batch classification |
 
 ### Parameters
 
@@ -219,9 +195,8 @@ class ClassificationResult:
 | Use Case | Recommended Method |
 |----------|-------------------|
 | Speed is critical, no confidence needed | `generate` |
-| Speed with confidence scores | `classify` / `score_fast` |
-| Accurate confidence scores | `classify_complete` / `score_complete` |
-| Batch processing | `batch_classify` or `batch_classify_complete` |
+| Accurate confidence scores | `classify` / `score` |
+| Batch processing | `batch_classify` or `batch_score` |
 | Concurrent processing | Async variants (`aclassify`, etc.) |
 
 ## License

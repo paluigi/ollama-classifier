@@ -3,7 +3,6 @@
 This script demonstrates various features of the ollama-classifier package:
 - Basic classification
 - Classification with label descriptions
-- Fast vs complete scoring methods
 - Batch classification
 - Async usage
 """
@@ -89,10 +88,10 @@ def custom_system_prompt():
     print(f"Probabilities: {result.probabilities}")
 
 
-def fast_vs_complete_scoring():
-    """Compare fast (single-call) vs complete (multi-call) scoring."""
+def scoring():
+    """Score text to get probability distribution over choices."""
     print("\n" + "=" * 60)
-    print("Fast vs Complete Scoring")
+    print("Scoring (Multi-call evaluation with softmax)")
     print("=" * 60)
     
     client = Client()
@@ -101,19 +100,12 @@ def fast_vs_complete_scoring():
     text = "The movie was absolutely fantastic!"
     choices = ["positive", "negative", "neutral"]
     
-    # Fast scoring - single API call, extracts logprobs from token distribution
-    print("\n--- Fast Scoring (single API call) ---")
-    result_fast = classifier.score_fast(text=text, choices=choices)
-    print(f"Prediction: {result_fast.prediction}")
-    print(f"Confidence: {result_fast.confidence:.2%}")
-    print(f"Probabilities: {result_fast.probabilities}")
-    
-    # Complete scoring - multiple API calls, more accurate probability distribution
-    print("\n--- Complete Scoring (multiple API calls) ---")
-    result_complete = classifier.score_complete(text=text, choices=choices)
-    print(f"Prediction: {result_complete.prediction}")
-    print(f"Confidence: {result_complete.confidence:.2%}")
-    print(f"Probabilities: {result_complete.probabilities}")
+    # Score uses multi-call evaluation for calibrated probabilities
+    result = classifier.score(text=text, choices=choices)
+    print(f"Text: {text}")
+    print(f"Prediction: {result.prediction}")
+    print(f"Confidence: {result.confidence:.2%}")
+    print(f"Probabilities: {result.probabilities}")
 
 
 def generate_only():
@@ -156,19 +148,10 @@ def batch_classification():
     
     choices = ["sports", "finance", "technology"]
     
-    # Batch classify with fast scoring
-    print("\n--- Batch Classify (Fast) ---")
+    # Batch classify with calibrated confidence scores
     results = classifier.batch_classify(texts=texts, choices=choices)
     
     for text, result in zip(texts, results):
-        print(f"Text: {text}")
-        print(f"  Prediction: {result.prediction} ({result.confidence:.2%})")
-    
-    # Batch classify with complete scoring
-    print("\n--- Batch Classify (Complete) ---")
-    results_complete = classifier.batch_classify_complete(texts=texts, choices=choices)
-    
-    for text, result in zip(texts, results_complete):
         print(f"Text: {text}")
         print(f"  Prediction: {result.prediction} ({result.confidence:.2%})")
 
@@ -229,7 +212,7 @@ def main():
     basic_classification()
     classification_with_descriptions()
     custom_system_prompt()
-    fast_vs_complete_scoring()
+    scoring()
     generate_only()
     batch_classification()
     

@@ -18,7 +18,7 @@ class OllamaClassifier:
     """A classifier wrapper around Ollama client for text classification.
     
     This class provides methods for classifying text into a set of predefined choices
-    with support for both fast (single-call) and complete (multi-call) scoring methods.
+    with calibrated probability scores using multi-call evaluation.
     
     Attributes:
         _client: The Ollama client (sync or async).
@@ -97,86 +97,10 @@ class OllamaClassifier:
         return [self.generate(text, choices, system_prompt) for text in texts]
     
     # =========================================================================
-    # Sync Methods - Score Fast (Single-call logprob extraction)
+    # Sync Methods - Score (Multi-call evaluation with softmax)
     # =========================================================================
     
-    def score_fast(
-        self,
-        text: str,
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> ClassificationResult:
-        """Score a classification using single-call logprob extraction.
-        
-        Makes one API call with logprobs enabled and extracts the probability
-        distribution from the token distribution at the decision point.
-        This is faster but may be less reliable for capturing all choice probabilities.
-        
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
-        """
-        labels = get_choice_labels(choices)
-        system, user = build_classification_prompt(text, choices, system_prompt)
-        schema = build_json_schema_for_choices(labels)
-        
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        
-        response = self._client.chat(
-            model=self._model,
-            messages=messages,
-            format=schema,
-            logprobs=True,
-            top_logprobs=20,
-            options={"temperature": 0.0},
-        )
-        
-        # Extract prediction from response
-        result = json.loads(response.message.content)
-        prediction = result.get("label", "")
-        
-        # Extract logprobs from token distribution
-        probabilities = self._extract_probabilities_from_logprobs(
-            response, labels
-        )
-        
-        return ClassificationResult(
-            prediction=prediction,
-            confidence=probabilities.get(prediction, 0.0),
-            probabilities=probabilities,
-            raw_response=response,
-        )
-    
-    def batch_score_fast(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[ClassificationResult]:
-        """Score multiple texts using fast single-call method.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        return [self.score_fast(text, choices, system_prompt) for text in texts]
-    
-    # =========================================================================
-    # Sync Methods - Score Complete (Multi-call evaluation)
-    # =========================================================================
-    
-    def score_complete(
+    def score(
         self,
         text: str,
         choices: ChoicesType,
@@ -186,7 +110,7 @@ class OllamaClassifier:
         
         Makes separate API calls for each choice to compute log P(choice|context),
         then applies softmax for calibrated probabilities.
-        This is more accurate but slower (N API calls for N choices).
+        This makes N API calls for N choices.
         
         Args:
             text: The text to classify.
@@ -219,13 +143,13 @@ class OllamaClassifier:
             raw_response={"logprobs": logprobs},
         )
     
-    def batch_score_complete(
+    def batch_score(
         self,
         texts: List[str],
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> List[ClassificationResult]:
-        """Score multiple texts using complete multi-call method.
+        """Score multiple texts using multi-call method.
         
         Args:
             texts: List of texts to classify.
@@ -235,10 +159,10 @@ class OllamaClassifier:
         Returns:
             List of ClassificationResults, one per input text.
         """
-        return [self.score_complete(text, choices, system_prompt) for text in texts]
+        return [self.score(text, choices, system_prompt) for text in texts]
     
     # =========================================================================
-    # Sync Methods - Classify (Generate + Score)
+    # Sync Methods - Classify
     # =========================================================================
     
     def classify(
@@ -247,31 +171,10 @@ class OllamaClassifier:
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Classify text using fast single-call scoring.
+        """Classify text with calibrated confidence scores.
 
-        Calls score_fast(), which uses constrained JSON generation and extracts
-        probabilities from the token logprobs in the same call.
-
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-
-        Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
-        """
-        return self.score_fast(text, choices, system_prompt)
-    
-    def classify_complete(
-        self,
-        text: str,
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> ClassificationResult:
-        """Classify text with complete scoring (N API calls, calibrated probabilities).
-
-        Uses score_complete() which makes one forced-choice API call per label,
-        then picks the highest-probability label as the prediction.
+        Uses multi-call evaluation to compute calibrated probabilities for each choice.
+        Makes N API calls for N choices.
 
         Args:
             text: The text to classify.
@@ -281,7 +184,7 @@ class OllamaClassifier:
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
-        return self.score_complete(text, choices, system_prompt)
+        return self.score(text, choices, system_prompt)
     
     def batch_classify(
         self,
@@ -289,7 +192,7 @@ class OllamaClassifier:
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> List[ClassificationResult]:
-        """Classify multiple texts with fast scoring.
+        """Classify multiple texts with calibrated confidence scores.
         
         Args:
             texts: List of texts to classify.
@@ -300,24 +203,6 @@ class OllamaClassifier:
             List of ClassificationResults, one per input text.
         """
         return [self.classify(text, choices, system_prompt) for text in texts]
-    
-    def batch_classify_complete(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[ClassificationResult]:
-        """Classify multiple texts with complete scoring.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        return [self.classify_complete(text, choices, system_prompt) for text in texts]
     
     # =========================================================================
     # Async Methods - Generate
@@ -384,95 +269,16 @@ class OllamaClassifier:
         ])
     
     # =========================================================================
-    # Async Methods - Score Fast
+    # Async Methods - Score
     # =========================================================================
     
-    async def ascore_fast(
+    async def ascore(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Async version of score_fast().
-        
-        Score a classification using single-call logprob extraction.
-        
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
-        """
-        labels = get_choice_labels(choices)
-        system, user = build_classification_prompt(text, choices, system_prompt)
-        schema = build_json_schema_for_choices(labels)
-        
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        
-        response = await self._client.chat(
-            model=self._model,
-            messages=messages,
-            format=schema,
-            logprobs=True,
-            top_logprobs=20,
-            options={"temperature": 0.0},
-        )
-        
-        # Extract prediction from response
-        result = json.loads(response.message.content)
-        prediction = result.get("label", "")
-        
-        # Extract logprobs from token distribution
-        probabilities = self._extract_probabilities_from_logprobs(
-            response, labels
-        )
-        
-        return ClassificationResult(
-            prediction=prediction,
-            confidence=probabilities.get(prediction, 0.0),
-            probabilities=probabilities,
-            raw_response=response,
-        )
-    
-    async def abatch_score_fast(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[ClassificationResult]:
-        """Async version of batch_score_fast().
-        
-        Score multiple texts using fast single-call method.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        import asyncio
-        return await asyncio.gather(*[
-            self.ascore_fast(text, choices, system_prompt) for text in texts
-        ])
-    
-    # =========================================================================
-    # Async Methods - Score Complete
-    # =========================================================================
-    
-    async def ascore_complete(
-        self,
-        text: str,
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> ClassificationResult:
-        """Async version of score_complete().
+        """Async version of score().
         
         Score a classification using multi-call evaluation with softmax.
         
@@ -511,15 +317,15 @@ class OllamaClassifier:
             raw_response={"logprobs": logprobs},
         )
     
-    async def abatch_score_complete(
+    async def abatch_score(
         self,
         texts: List[str],
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> List[ClassificationResult]:
-        """Async version of batch_score_complete().
+        """Async version of batch_score().
         
-        Score multiple texts using complete multi-call method.
+        Score multiple texts using multi-call method.
         
         Args:
             texts: List of texts to classify.
@@ -531,7 +337,7 @@ class OllamaClassifier:
         """
         import asyncio
         return await asyncio.gather(*[
-            self.ascore_complete(text, choices, system_prompt) for text in texts
+            self.ascore(text, choices, system_prompt) for text in texts
         ])
     
     # =========================================================================
@@ -546,7 +352,7 @@ class OllamaClassifier:
     ) -> ClassificationResult:
         """Async version of classify().
 
-        Classify text using fast single-call scoring (see score_fast).
+        Classify text with calibrated confidence scores using multi-call evaluation.
 
         Args:
             text: The text to classify.
@@ -556,28 +362,7 @@ class OllamaClassifier:
         Returns:
             ClassificationResult with prediction, confidence, and probabilities.
         """
-        return await self.ascore_fast(text, choices, system_prompt)
-    
-    async def aclassify_complete(
-        self,
-        text: str,
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> ClassificationResult:
-        """Async version of classify_complete().
-
-        Classify text with complete scoring (N concurrent API calls, calibrated
-        probabilities). Picks the highest-probability label as the prediction.
-
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-
-        Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
-        """
-        return await self.ascore_complete(text, choices, system_prompt)
+        return await self.ascore(text, choices, system_prompt)
     
     async def abatch_classify(
         self,
@@ -587,7 +372,7 @@ class OllamaClassifier:
     ) -> List[ClassificationResult]:
         """Async version of batch_classify().
         
-        Classify multiple texts with fast scoring.
+        Classify multiple texts with calibrated confidence scores.
         
         Args:
             texts: List of texts to classify.
@@ -602,155 +387,9 @@ class OllamaClassifier:
             self.aclassify(text, choices, system_prompt) for text in texts
         ])
     
-    async def abatch_classify_complete(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[ClassificationResult]:
-        """Async version of batch_classify_complete().
-        
-        Classify multiple texts with complete scoring.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        import asyncio
-        return await asyncio.gather(*[
-            self.aclassify_complete(text, choices, system_prompt) for text in texts
-        ])
-    
     # =========================================================================
     # Private Helper Methods
     # =========================================================================
-
-    def _extract_probabilities_from_logprobs(
-        self,
-        response: Any,
-        labels: List[str],
-    ) -> Dict[str, float]:
-        """Extract probabilities from logprobs in the response.
-
-        Locates the token position where the label value begins in the generated
-        JSON output, then walks forward position by position accumulating the
-        log-probability for each label until every label has been fully resolved.
-        At each position the best-matching token for each label is looked up in
-        ``top_logprobs``; its logprob is added to that label's running score and
-        the matched character count is advanced.  This continues until all labels
-        are fully consumed, ensuring that labels sharing a long common prefix are
-        always unambiguously distinguished.
-
-        Args:
-            response: The raw ChatResponse object returned by the Ollama client.
-            labels: List of valid choice labels.
-
-        Returns:
-            Dict mapping choice labels to probabilities (summing to 1.0).
-        """
-        logprobs_data = response.logprobs  # List[Logprob] | None
-
-        if not logprobs_data:
-            # No logprobs available – return uniform distribution
-            return {label: 1.0 / len(labels) for label in labels}
-
-        # ------------------------------------------------------------------
-        # Step 1: find the start position.
-        #
-        # The model generates JSON of the form `{ "label": "CHOICE" }`.
-        # We scan for the first token whose text (stripped of surrounding
-        # spaces and quote characters) is a non-empty prefix of at least one
-        # label.  For the example above this lands on the token `b` (start of
-        # "bullish"), skipping the structural tokens `{`, ` "`, `label`, `":`,
-        # and ` "`.
-        # ------------------------------------------------------------------
-        start_idx: int | None = None
-        for i, lp in enumerate(logprobs_data):
-            clean = lp.token.strip(' "\n\r\t')
-            if clean and any(
-                label.lower().startswith(clean.lower()) for label in labels
-            ):
-                start_idx = i
-                break
-
-        if start_idx is None:
-            # Could not locate the decision point – fall back to uniform
-            return {label: 1.0 / len(labels) for label in labels}
-
-        # ------------------------------------------------------------------
-        # Step 2: walk forward from start_idx accumulating per-label scores.
-        #
-        # For each label we track:
-        #   - ``consumed``: how many characters of the label have been matched
-        #   - ``score``:    sum of logprobs of matched tokens (starts at 0.0)
-        #
-        # At every position we build a token→logprob lookup from top_logprobs
-        # (plus the actually-generated token, which may be absent from the
-        # top list).  For each still-unresolved label we find the longest
-        # token in that lookup whose stripped text is a prefix of the label's
-        # remaining characters, add its logprob to the label's score, and
-        # advance ``consumed`` accordingly.
-        #
-        # We stop as soon as every label has been fully consumed, or when we
-        # run out of token positions.
-        # ------------------------------------------------------------------
-        label_score: Dict[str, float] = {label: 0.0 for label in labels}
-        label_consumed: Dict[str, int] = {label: 0 for label in labels}
-        label_matched: Dict[str, bool] = {label: False for label in labels}
-
-        for i in range(start_idx, len(logprobs_data)):
-            lp = logprobs_data[i]
-
-            # Build token → logprob map; ensure the generated token is present
-            token_map: Dict[str, float] = {
-                t.token: t.logprob for t in (lp.top_logprobs or [])
-            }
-            token_map[lp.token] = lp.logprob
-
-            all_done = True
-            for label in labels:
-                consumed = label_consumed[label]
-                if consumed >= len(label):
-                    continue  # this label is already fully matched
-                all_done = False
-
-                remaining = label[consumed:]  # characters yet to be matched
-
-                # Find the longest token in token_map that is a prefix of
-                # `remaining` (case-insensitive after stripping whitespace and
-                # quote characters).
-                best_logprob: float = float("-inf")
-                best_len: int = 0
-
-                for token, logprob in token_map.items():
-                    clean_token = token.strip(' "\n\r\t')
-                    if not clean_token:
-                        continue
-                    if remaining.lower().startswith(clean_token.lower()):
-                        if len(clean_token) > best_len:
-                            best_logprob = logprob
-                            best_len = len(clean_token)
-
-                if best_len > 0:
-                    label_score[label] += best_logprob
-                    label_matched[label] = True
-                    label_consumed[label] += best_len
-
-            if all_done:
-                break
-
-        # Labels that never matched any token get -inf so softmax assigns them
-        # zero probability rather than the spuriously high weight of exp(0).
-        for label in labels:
-            if not label_matched[label]:
-                label_score[label] = float("-inf")
-
-        # Apply softmax to convert accumulated log-scores to probabilities
-        return self._softmax(label_score)
 
     def _get_choice_logprob(
         self,
