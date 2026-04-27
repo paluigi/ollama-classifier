@@ -17,7 +17,7 @@ ChoicesType
 .. autodata:: ollama_classifier.types.ChoicesType
 
 OllamaClassifier
-----------------
+-----------------
 
 .. autoclass:: ollama_classifier.classifier.OllamaClassifier
    :members:
@@ -25,31 +25,66 @@ OllamaClassifier
    :show-inheritance:
    :special-members: __init__
 
+LLMClassifier
+-------------
+
+The generic, backend-agnostic classifier. Accepts any
+:class:`~ollama_classifier.backends.base.LLMBackend` instance and
+exposes the same API as :class:`OllamaClassifier`.
+
+.. autoclass:: ollama_classifier.llm_classifier.LLMClassifier
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :special-members: __init__
+
+Backends
+--------
+
+.. automodule:: ollama_classifier.backends
+   :members:
+   :undoc-members:
+
+.. autoclass:: ollama_classifier.backends.base.LLMBackend
+   :members:
+   :show-inheritance:
+   :special-members: __init__
+
+.. autoclass:: ollama_classifier.backends.vllm.VLLMBackend
+   :members:
+   :show-inheritance:
+   :special-members: __init__
+
+.. autoclass:: ollama_classifier.backends.sglang.SGLangBackend
+   :members:
+   :show-inheritance:
+   :special-members: __init__
+
+.. autoclass:: ollama_classifier.backends.llamacpp.LlamaCppBackend
+   :members:
+   :show-inheritance:
+   :special-members: __init__
+
 Method Summary
 --------------
+
+Both :class:`OllamaClassifier` and :class:`LLMClassifier` expose the
+same method set:
 
 +-----------------------------------------------+------------------------+---------------------------------------------+
 | Method                                        | Async                  | Description                                 |
 +===============================================+========================+=============================================+
 | ``generate(text, choices, system_prompt)``    | ``agenerate``          | Constrained output only (fastest)           |
 +-----------------------------------------------+------------------------+---------------------------------------------+
-| ``score_fast(text, choices, system_prompt)``  | ``ascore_fast``        | Single-call logprob extraction              |
+| ``score(text, choices, system_prompt)``       | ``ascore``             | Multi-call evaluation with softmax          |
 +-----------------------------------------------+------------------------+---------------------------------------------+
-| ``score_complete(...)``                       | ``ascore_complete``    | Multi-call evaluation with softmax          |
-+-----------------------------------------------+------------------------+---------------------------------------------+
-| ``classify(text, choices, system_prompt)``    | ``aclassify``          | Generate + score_fast                       |
-+-----------------------------------------------+------------------------+---------------------------------------------+
-| ``classify_complete(...)``                    | ``aclassify_complete`` | Generate + score_complete                   |
+| ``classify(text, choices, system_prompt)``    | ``aclassify``          | Full classification with confidence scores  |
 +-----------------------------------------------+------------------------+---------------------------------------------+
 | ``batch_generate(texts, choices, ...)``       | ``abatch_generate``    | Batch constrained output                    |
 +-----------------------------------------------+------------------------+---------------------------------------------+
-| ``batch_score_fast(texts, choices, ...)``     | ``abatch_score_fast``  | Batch fast scoring                          |
+| ``batch_score(texts, choices, ...)``          | ``abatch_score``       | Batch scoring                               |
 +-----------------------------------------------+------------------------+---------------------------------------------+
-| ``batch_score_complete(texts, ...)``          | ``abatch_score_complete`` | Batch complete scoring                   |
-+-----------------------------------------------+------------------------+---------------------------------------------+
-| ``batch_classify(texts, choices, ...)``       | ``abatch_classify``    | Batch classify (fast)                       |
-+-----------------------------------------------+------------------------+---------------------------------------------+
-| ``batch_classify_complete(texts, ...)``       | ``abatch_classify_complete`` | Batch classify (complete)              |
+| ``batch_classify(texts, choices, ...)``       | ``abatch_classify``    | Batch classification                        |
 +-----------------------------------------------+------------------------+---------------------------------------------+
 
 Choosing a Method
@@ -60,11 +95,9 @@ Choosing a Method
 +==========================================+==================================================+
 | Speed is critical, no confidence needed  | ``generate``                                     |
 +------------------------------------------+--------------------------------------------------+
-| Speed with confidence scores             | ``classify`` / ``score_fast``                    |
+| Accurate confidence scores               | ``classify`` / ``score``                         |
 +------------------------------------------+--------------------------------------------------+
-| Accurate confidence scores               | ``classify_complete`` / ``score_complete``       |
-+------------------------------------------+--------------------------------------------------+
-| Batch processing                         | ``batch_classify`` or ``batch_classify_complete``|
+| Batch processing                         | ``batch_classify`` or ``batch_score``            |
 +------------------------------------------+--------------------------------------------------+
 | Concurrent processing                    | Async variants (``aclassify``, etc.)             |
 +------------------------------------------+--------------------------------------------------+
