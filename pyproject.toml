@@ -1,6 +1,6 @@
 [project]
 name = "ollama-classifier"
-version = "0.2.0"
+version = "0.3.0"
 description = "A wrapper around Ollama Python SDK for text classification with constrained output and confidence scoring"
 readme = "README.md"
 authors = [
@@ -14,6 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+backends = [
+    "httpx>=0.27.0",
+]
 docs = [
     "sphinx>=7.0.0",
     "sphinx-rtd-theme>=2.0.0",

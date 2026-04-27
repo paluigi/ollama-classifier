@@ -1,15 +1,16 @@
-"""Example usage of the Ollama Classifier.
+"""Example usage of the Ollama Classifier with multiple backends.
 
 This script demonstrates various features of the ollama-classifier package:
-- Basic classification
+- Basic classification with Ollama
 - Classification with label descriptions
 - Batch classification
 - Async usage
+- Usage with vLLM, SGLang, and llama.cpp backends
 """
 
 import asyncio
 from ollama import Client, AsyncClient
-from ollama_classifier import OllamaClassifier, ClassificationResult
+from ollama_classifier import OllamaClassifier, LLMClassifier, ClassificationResult
 
 
 def basic_classification():
@@ -202,13 +203,91 @@ async def async_batch_classification():
         print(f"  Prediction: {result.prediction} ({result.confidence:.2%})")
 
 
+def vllm_example():
+    """Classification using vLLM backend."""
+    print("\n" + "=" * 60)
+    print("vLLM Backend Classification")
+    print("=" * 60)
+    
+    from ollama_classifier.backends import VLLMBackend
+    
+    backend = VLLMBackend(
+        model="meta-llama/Llama-3.2-3B-Instruct",
+        base_url="http://localhost:8000/v1",
+    )
+    classifier = LLMClassifier(backend)
+    
+    text = "The new quantum processor architecture drastically reduces latency."
+    result = classifier.classify(
+        text=text,
+        choices=["technology", "sports", "politics", "entertainment"],
+    )
+    
+    print(f"Text: {text}")
+    print(f"Prediction: {result.prediction}")
+    print(f"Confidence: {result.confidence:.2%}")
+    print(f"Probabilities: {result.probabilities}")
+
+
+def sglang_example():
+    """Classification using SGLang backend."""
+    print("\n" + "=" * 60)
+    print("SGLang Backend Classification")
+    print("=" * 60)
+    
+    from ollama_classifier.backends import SGLangBackend
+    
+    backend = SGLangBackend(
+        model="meta-llama/Llama-3.2-3B-Instruct",
+        base_url="http://localhost:30000/v1",
+    )
+    classifier = LLMClassifier(backend)
+    
+    text = "The central bank raised interest rates by 50 basis points."
+    result = classifier.classify(
+        text=text,
+        choices=["sports", "finance", "technology", "entertainment"],
+    )
+    
+    print(f"Text: {text}")
+    print(f"Prediction: {result.prediction}")
+    print(f"Confidence: {result.confidence:.2%}")
+    print(f"Probabilities: {result.probabilities}")
+
+
+def llamacpp_example():
+    """Classification using llama.cpp backend."""
+    print("\n" + "=" * 60)
+    print("llama.cpp Backend Classification")
+    print("=" * 60)
+    
+    from ollama_classifier.backends import LlamaCppBackend
+    
+    backend = LlamaCppBackend(
+        model="model",
+        base_url="http://localhost:8080/v1",
+    )
+    classifier = LLMClassifier(backend)
+    
+    text = "The goalkeeper made an incredible save!"
+    result = classifier.classify(
+        text=text,
+        choices=["sports", "finance", "technology", "entertainment"],
+    )
+    
+    print(f"Text: {text}")
+    print(f"Prediction: {result.prediction}")
+    print(f"Confidence: {result.confidence:.2%}")
+    print(f"Probabilities: {result.probabilities}")
+
+
 def main():
     """Run all examples."""
     print("=" * 60)
     print("OLLAMA CLASSIFIER - EXAMPLE USAGE")
     print("=" * 60)
     
-    # Sync examples
+    # Sync examples (Ollama backend)
     basic_classification()
     classification_with_descriptions()
     custom_system_prompt()
@@ -216,13 +295,24 @@ def main():
     generate_only()
     batch_classification()
     
-    # Async examples
+    # Async examples (Ollama backend)
     print("\n" + "=" * 60)
     print("ASYNC EXAMPLES")
     print("=" * 60)
     
     asyncio.run(async_classification())
     asyncio.run(async_batch_classification())
+    
+    # Backend examples (require running servers)
+    print("\n" + "=" * 60)
+    print("BACKEND EXAMPLES (vLLM, SGLang, llama.cpp)")
+    print("=" * 60)
+    print("Note: These require running inference servers.")
+    print("Uncomment the relevant function calls below to try them.\n")
+    
+    # vllm_example()       # Requires: vllm server on localhost:8000
+    # sglang_example()     # Requires: sglang server on localhost:30000
+    # llamacpp_example()   # Requires: llama-server on localhost:8080
     
     print("\n" + "=" * 60)
     print("ALL EXAMPLES COMPLETED")
