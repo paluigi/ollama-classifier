@@ -156,3 +156,79 @@ The :class:`~ollama_classifier.types.ClassificationResult` object contains:
 
    # Raw response for debugging
    print(result.raw_response)
+
+Using Sample Data
+-----------------
+
+The package ships with ready-to-use sample datasets in
+``examples/sample_data.py`` so you can test the classifier immediately.
+Two datasets are provided, both containing 20 short customer-support
+ticket texts across four labels (``billing``, ``technical_support``,
+``account``, ``general``):
+
+- ``DATASET_WITHOUT_DESCRIPTIONS`` — labels as a plain ``list``.
+- ``DATASET_WITH_DESCRIPTIONS`` — labels as a ``dict`` mapping each
+  label to a human-readable description, which typically improves
+  classification accuracy.
+
+Each dataset is a :class:`~dataclasses.dataclass` with four fields:
+``texts``, ``choices``, ``expected_labels``, and ``description``.
+
+Import the datasets:
+
+.. code-block:: python
+
+   from examples.sample_data import (
+       DATASET_WITHOUT_DESCRIPTIONS,
+       DATASET_WITH_DESCRIPTIONS,
+   )
+
+Quick test with the basic dataset:
+
+.. code-block:: python
+
+   from ollama import Client
+   from ollama_classifier import OllamaClassifier
+   from examples.sample_data import DATASET_WITHOUT_DESCRIPTIONS
+
+   client = Client()
+   classifier = OllamaClassifier(client, model="llama3.2")
+
+   predictions = classifier.batch_generate(
+       texts=DATASET_WITHOUT_DESCRIPTIONS.texts,
+       choices=DATASET_WITHOUT_DESCRIPTIONS.choices,
+   )
+
+   correct = sum(p == e for p, e in
+                   zip(predictions, DATASET_WITHOUT_DESCRIPTIONS.expected_labels))
+   print(f"Accuracy: {correct}/{len(predictions)}")
+
+Comparing with and without descriptions:
+
+.. code-block:: python
+
+   from examples.sample_data import (
+       DATASET_WITHOUT_DESCRIPTIONS,
+       DATASET_WITH_DESCRIPTIONS,
+   )
+
+   preds_simple = classifier.batch_generate(
+       texts=DATASET_WITHOUT_DESCRIPTIONS.texts,
+       choices=DATASET_WITHOUT_DESCRIPTIONS.choices,
+   )
+
+   preds_desc = classifier.batch_generate(
+       texts=DATASET_WITH_DESCRIPTIONS.texts,
+       choices=DATASET_WITH_DESCRIPTIONS.choices,
+   )
+
+   print(f"Without descriptions: "
+         f"{sum(p == e for p, e in zip(preds_simple, DATASET_WITHOUT_DESCRIPTIONS.expected_labels))}/{len(preds_simple)}")
+   print(f"With descriptions:    "
+         f"{sum(p == e for p, e in zip(preds_desc, DATASET_WITH_DESCRIPTIONS.expected_labels))}/{len(preds_desc)}")
+
+Run the bundled example script directly:
+
+.. code-block:: bash
+
+   python -m examples.run_sample_data
