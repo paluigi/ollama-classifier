@@ -391,6 +391,78 @@ class ClassificationResult:
 | Batch processing | `batch_classify` or `batch_score` |
 | Concurrent processing | Async variants (`aclassify`, etc.) |
 
+## Sample Data
+
+The package ships with ready-to-use sample datasets under ``examples/sample_data.py`` so you can test the classifier immediately without preparing your own data.
+
+Two datasets are provided, both containing 20 short customer-support ticket texts across 4 labels (`billing`, `technical_support`, `account`, `general`):
+
+- **`DATASET_WITHOUT_DESCRIPTIONS`** — labels as a plain ``list``.
+- **`DATASET_WITH_DESCRIPTIONS`** — labels as a ``dict`` mapping each label to a human-readable description, which improves classification accuracy.
+
+### Import the datasets
+
+```python
+from examples.sample_data import DATASET_WITHOUT_DESCRIPTIONS, DATASET_WITH_DESCRIPTIONS
+```
+
+Each dataset is a ``SampleDataset`` dataclass with these fields:
+
+| Attribute         | Type                            | Description                                      |
+|-------------------|---------------------------------|--------------------------------------------------|
+| ``texts``         | ``List[str]``                   | Short texts to classify                          |
+| ``choices``       | ``List[str]`` or ``Dict[str, str]`` | Label list or label→description dict           |
+| ``expected_labels`` | ``List[str]``                 | Expected correct label for each text             |
+| ``description``   | ``str``                         | Human-readable description of the dataset        |
+
+### Run a quick test
+
+```python
+from ollama import Client
+from ollama_classifier import OllamaClassifier
+from examples.sample_data import DATASET_WITHOUT_DESCRIPTIONS
+
+client = Client()
+classifier = OllamaClassifier(client, model="llama3.2")
+
+predictions = classifier.batch_generate(
+    texts=DATASET_WITHOUT_DESCRIPTIONS.texts,
+    choices=DATASET_WITHOUT_DESCRIPTIONS.choices,
+)
+
+# Verify accuracy
+correct = sum(p == e for p, e in
+               zip(predictions, DATASET_WITHOUT_DESCRIPTIONS.expected_labels))
+print(f"Accuracy: {correct}/{len(predictions)}")
+```
+
+### Compare with vs. without descriptions
+
+```python
+from examples.sample_data import DATASET_WITHOUT_DESCRIPTIONS, DATASET_WITH_DESCRIPTIONS
+
+# Without descriptions
+preds_simple = classifier.batch_generate(
+    texts=DATASET_WITHOUT_DESCRIPTIONS.texts,
+    choices=DATASET_WITHOUT_DESCRIPTIONS.choices,
+)
+
+# With descriptions (typically more accurate)
+preds_desc = classifier.batch_generate(
+    texts=DATASET_WITH_DESCRIPTIONS.texts,
+    choices=DATASET_WITH_DESCRIPTIONS.choices,
+)
+
+print(f"Without descriptions: {sum(p == e for p, e in zip(preds_simple, DATASET_WITHOUT_DESCRIPTIONS.expected_labels))}/{len(preds_simple)}")
+print(f"With descriptions:    {sum(p == e for p, e in zip(preds_desc, DATASET_WITH_DESCRIPTIONS.expected_labels))}/{len(preds_desc)}")
+```
+
+### Run the bundled example script
+
+```bash
+python -m examples.run_sample_data
+```
+
 ## License
 
 MIT License
