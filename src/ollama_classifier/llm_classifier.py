@@ -152,16 +152,16 @@ class LLMClassifier:
         return [self.generate(text, choices, system_prompt) for text in texts]
 
     # =========================================================================
-    # Sync Methods - Score (Multi-call evaluation with softmax)
+    # Sync Methods - Classify (Multi-call evaluation with softmax)
     # =========================================================================
 
-    def score(
+    def classify(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Score a classification using multi-call evaluation with softmax.
+        """Classify text using multi-call evaluation with softmax.
 
         Makes separate API calls for each choice to compute
         log P(choice|context), then applies softmax for calibrated
@@ -192,51 +192,6 @@ class LLMClassifier:
             probabilities=probabilities,
             raw_response={"logprobs": logprobs},
         )
-
-    def batch_score(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[ClassificationResult]:
-        """Score multiple texts using multi-call method.
-
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping
-                     labels to descriptions.
-            system_prompt: Optional custom system prompt.
-
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        return [self.score(text, choices, system_prompt) for text in texts]
-
-    # =========================================================================
-    # Sync Methods - Classify
-    # =========================================================================
-
-    def classify(
-        self,
-        text: str,
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> ClassificationResult:
-        """Classify text with calibrated confidence scores.
-
-        Uses multi-call evaluation to compute calibrated probabilities
-        for each choice.  Makes N API calls for N choices.
-
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping
-                     labels to descriptions.
-            system_prompt: Optional custom system prompt.
-
-        Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
-        """
-        return self.score(text, choices, system_prompt)
 
     def batch_classify(
         self,
@@ -296,16 +251,16 @@ class LLMClassifier:
         )
 
     # =========================================================================
-    # Async Methods - Score
+    # Async Methods - Classify
     # =========================================================================
 
-    async def ascore(
+    async def aclassify(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Async version of :meth:`score`."""
+        """Async version of :meth:`classify`."""
         import asyncio
 
         labels = get_choice_labels(choices)
@@ -326,32 +281,6 @@ class LLMClassifier:
             probabilities=probabilities,
             raw_response={"logprobs": logprobs},
         )
-
-    async def abatch_score(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[ClassificationResult]:
-        """Async version of :meth:`batch_score`."""
-        import asyncio
-
-        return await asyncio.gather(
-            *[self.ascore(text, choices, system_prompt) for text in texts]
-        )
-
-    # =========================================================================
-    # Async Methods - Classify
-    # =========================================================================
-
-    async def aclassify(
-        self,
-        text: str,
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> ClassificationResult:
-        """Async version of :meth:`classify`."""
-        return await self.ascore(text, choices, system_prompt)
 
     async def abatch_classify(
         self,
@@ -376,7 +305,7 @@ class LLMClassifier:
         user: str,
         choice: str,
     ) -> float:
-        """Compute a log-probability score for a single choice.
+        """Compute a log-probability for a single choice.
 
         Forces the model to output *choice* and returns the sum of
         logprobs of all generated tokens.

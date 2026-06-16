@@ -97,17 +97,17 @@ class OllamaClassifier:
         return [self.generate(text, choices, system_prompt) for text in texts]
     
     # =========================================================================
-    # Sync Methods - Score (Multi-call evaluation with softmax)
+    # Sync Methods - Classify (Multi-call evaluation with softmax)
     # =========================================================================
     
-    def score(
+    def classify(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Score a classification using multi-call evaluation with softmax.
-        
+        """Classify text using multi-call evaluation with softmax.
+
         Makes separate API calls for each choice to compute log P(choice|context),
         then applies softmax for calibrated probabilities.
         This makes N API calls for N choices.
@@ -142,49 +142,6 @@ class OllamaClassifier:
             probabilities=probabilities,
             raw_response={"logprobs": logprobs},
         )
-    
-    def batch_score(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[ClassificationResult]:
-        """Score multiple texts using multi-call method.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        return [self.score(text, choices, system_prompt) for text in texts]
-    
-    # =========================================================================
-    # Sync Methods - Classify
-    # =========================================================================
-    
-    def classify(
-        self,
-        text: str,
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> ClassificationResult:
-        """Classify text with calibrated confidence scores.
-
-        Uses multi-call evaluation to compute calibrated probabilities for each choice.
-        Makes N API calls for N choices.
-
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-
-        Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
-        """
-        return self.score(text, choices, system_prompt)
     
     def batch_classify(
         self,
@@ -269,18 +226,19 @@ class OllamaClassifier:
         ])
     
     # =========================================================================
-    # Async Methods - Score
+    # Async Methods - Classify
     # =========================================================================
     
-    async def ascore(
+    async def aclassify(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Async version of score().
-        
-        Score a classification using multi-call evaluation with softmax.
+        """Async version of classify().
+
+        Classify text using multi-call evaluation with softmax.
+        Computes logprobs concurrently for all choices.
         
         Args:
             text: The text to classify.
@@ -317,53 +275,6 @@ class OllamaClassifier:
             raw_response={"logprobs": logprobs},
         )
     
-    async def abatch_score(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[ClassificationResult]:
-        """Async version of batch_score().
-        
-        Score multiple texts using multi-call method.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        import asyncio
-        return await asyncio.gather(*[
-            self.ascore(text, choices, system_prompt) for text in texts
-        ])
-    
-    # =========================================================================
-    # Async Methods - Classify
-    # =========================================================================
-    
-    async def aclassify(
-        self,
-        text: str,
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> ClassificationResult:
-        """Async version of classify().
-
-        Classify text with calibrated confidence scores using multi-call evaluation.
-
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-
-        Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
-        """
-        return await self.ascore(text, choices, system_prompt)
-    
     async def abatch_classify(
         self,
         texts: List[str],
@@ -397,11 +308,11 @@ class OllamaClassifier:
         user: str,
         choice: str,
     ) -> float:
-        """Compute a log-probability score for a single choice.
+        """Compute a log-probability for a single choice.
 
         Generates a response with a single-value schema that forces the model
         to output ``choice`` and returns the sum of logprobs of all generated
-        tokens.  This gives a score proportional to how naturally the model
+        tokens.  This gives a value proportional to how naturally the model
         produces that choice given the context; applying softmax across all
         choices yields calibrated probabilities.
 
@@ -444,7 +355,7 @@ class OllamaClassifier:
     ) -> float:
         """Async version of _get_choice_logprob().
 
-        Compute a log-probability score for a single choice.
+        Compute a log-probability for a single choice.
 
         Args:
             system: System prompt.
