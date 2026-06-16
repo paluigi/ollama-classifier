@@ -166,12 +166,12 @@ result = classifier.classify(
 )
 ```
 
-### Scoring (Multi-Call with Softmax)
+### Classification with Confidence Scores
 
 Get calibrated probability distribution over all choices. Makes N API calls for N choices:
 
 ```python
-result = classifier.score(
+result = classifier.classify(
     text="The movie was fantastic!",
     choices=["positive", "negative", "neutral"]
 )
@@ -356,10 +356,8 @@ class ClassificationResult:
 | Method | Async | Description |
 |--------|-------|-------------|
 | `generate(text, choices, system_prompt)` | `agenerate` | Constrained output only (fastest) |
-| `score(text, choices, system_prompt)` | `ascore` | Multi-call evaluation with softmax |
-| `classify(text, choices, system_prompt)` | `aclassify` | Full classification with confidence scores |
+| `classify(text, choices, system_prompt)` | `aclassify` | Classification with calibrated confidence scores |
 | `batch_generate(texts, choices, system_prompt)` | `abatch_generate` | Batch constrained output |
-| `batch_score(texts, choices, system_prompt)` | `abatch_score` | Batch scoring |
 | `batch_classify(texts, choices, system_prompt)` | `abatch_classify` | Batch classification |
 
 ### LLMClassifier Methods
@@ -369,10 +367,8 @@ class ClassificationResult:
 | Method | Async | Description |
 |--------|-------|-------------|
 | `generate(text, choices, system_prompt)` | `agenerate` | Constrained output only (fastest) |
-| `score(text, choices, system_prompt)` | `ascore` | Multi-call evaluation with softmax |
-| `classify(text, choices, system_prompt)` | `aclassify` | Full classification with confidence scores |
+| `classify(text, choices, system_prompt)` | `aclassify` | Classification with calibrated confidence scores |
 | `batch_generate(texts, choices, system_prompt)` | `abatch_generate` | Batch constrained output |
-| `batch_score(texts, choices, system_prompt)` | `abatch_score` | Batch scoring |
 | `batch_classify(texts, choices, system_prompt)` | `abatch_classify` | Batch classification |
 
 ### Parameters
@@ -387,8 +383,8 @@ class ClassificationResult:
 | Use Case | Recommended Method |
 |----------|-------------------|
 | Speed is critical, no confidence needed | `generate` |
-| Accurate confidence scores | `classify` / `score` |
-| Batch processing | `batch_classify` or `batch_score` |
+| Accurate confidence scores | `classify` |
+| Batch processing | `batch_classify` |
 | Concurrent processing | Async variants (`aclassify`, etc.) |
 
 ## Sample Data

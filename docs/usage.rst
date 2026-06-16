@@ -57,15 +57,15 @@ Override the default system prompt for specialized tasks:
                      "Classify financial news based on market sentiment."
    )
 
-Scoring (Multi-Call with Softmax)
----------------------------------
+Classification with Confidence Scores (Multi-Call with Softmax)
+---------------------------------------------------------------
 
 Get calibrated probability distribution over all choices.
 Makes N API calls for N choices:
 
 .. code-block:: python
 
-   result = classifier.score(
+   result = classifier.classify(
        text="The movie was fantastic!",
        choices=["positive", "negative", "neutral"]
    )

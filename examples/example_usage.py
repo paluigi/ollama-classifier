@@ -89,10 +89,10 @@ def custom_system_prompt():
     print(f"Probabilities: {result.probabilities}")
 
 
-def scoring():
-    """Score text to get probability distribution over choices."""
+def classification_with_confidence():
+    """Classify text with calibrated confidence scores (multi-call evaluation with softmax)."""
     print("\n" + "=" * 60)
-    print("Scoring (Multi-call evaluation with softmax)")
+    print("Classification with Confidence Scores (Multi-call with Softmax)")
     print("=" * 60)
     
     client = Client()
@@ -101,8 +101,7 @@ def scoring():
     text = "The movie was absolutely fantastic!"
     choices = ["positive", "negative", "neutral"]
     
-    # Score uses multi-call evaluation for calibrated probabilities
-    result = classifier.score(text=text, choices=choices)
+    result = classifier.classify(text=text, choices=choices)
     print(f"Text: {text}")
     print(f"Prediction: {result.prediction}")
     print(f"Confidence: {result.confidence:.2%}")
@@ -291,7 +290,7 @@ def main():
     basic_classification()
     classification_with_descriptions()
     custom_system_prompt()
-    scoring()
+    classification_with_confidence()
     generate_only()
     batch_classification()
     

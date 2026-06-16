@@ -12,9 +12,8 @@ class ClassificationResult:
         prediction: The predicted class label.
         confidence: Confidence score for the prediction (0.0 to 1.0).
         probabilities: Probability distribution over all choices.
-        raw_response: Raw response from Ollama API for debugging.
-            May be a ChatResponse object (from score_fast) or a plain dict
-            (from score_complete, which stores {"logprobs": ...}).
+        raw_response: Raw response from the API for debugging.
+            Stores {"logprobs": ...} from multi-call evaluation.
     """
     prediction: str
     confidence: float
