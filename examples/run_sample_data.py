@@ -6,8 +6,8 @@ Run this script with Ollama installed and a model pulled::
     python -m examples.run_sample_data
 """
 
-from ollama import Client
-from ollama_classifier import OllamaClassifier
+from ollama_classifier import LLMClassifier
+from ollama_classifier.backends import OllamaBackend
 
 from examples.sample_data import (
     DATASET_WITHOUT_DESCRIPTIONS,
@@ -17,58 +17,61 @@ from examples.sample_data import (
 
 def evaluate(results, expected_labels):
     """Print results and compute accuracy."""
-    correct = sum(r == e for r, e in zip(results, expected_labels))
+    # Each result is a ClassificationResult; extract .prediction for comparison
+    correct = sum(r.prediction == e for r, e in zip(results, expected_labels))
     total = len(expected_labels)
     print(f"Accuracy: {correct}/{total} ({correct / total:.0%})\n")
 
 
 def main():
-    client = Client()
-    classifier = OllamaClassifier(client, model="llama3.2")
+    backend = OllamaBackend(model="llama3.2")
+    classifier = LLMClassifier(backend)
 
     # ── Dataset without descriptions ────────────────────────────────────
     print("=" * 60)
-    print("Dataset WITHOUT descriptions")
+    print("Dataset WITHOUT descriptions (generate, max_calls=1)")
     print("=" * 60)
     print(DATASET_WITHOUT_DESCRIPTIONS.description)
     print()
 
-    predictions = classifier.batch_generate(
+    # Adaptive generation: single call per text, fast & approximate
+    results = classifier.batch_generate(
         texts=DATASET_WITHOUT_DESCRIPTIONS.texts,
         choices=DATASET_WITHOUT_DESCRIPTIONS.choices,
     )
-    for text, pred, expected in zip(
+    for text, result, expected in zip(
         DATASET_WITHOUT_DESCRIPTIONS.texts,
-        predictions,
+        results,
         DATASET_WITHOUT_DESCRIPTIONS.expected_labels,
     ):
-        mark = "✓" if pred == expected else "✗"
+        mark = "✓" if result.prediction == expected else "✗"
         print(f"  {mark} {text}")
-        print(f"    Predicted: {pred}  |  Expected: {expected}\n")
+        print(f"    Predicted: {result.prediction}  |  Expected: {expected}\n")
 
-    evaluate(predictions, DATASET_WITHOUT_DESCRIPTIONS.expected_labels)
+    evaluate(results, DATASET_WITHOUT_DESCRIPTIONS.expected_labels)
 
-    # ── Dataset with descriptions ────────────────────────────────────────
+    # ── Dataset with descriptions (exact multi-call) ─────────────────────
     print("=" * 60)
-    print("Dataset WITH descriptions")
+    print("Dataset WITH descriptions (classify — multi_call)")
     print("=" * 60)
     print(DATASET_WITH_DESCRIPTIONS.description)
     print()
 
-    predictions_desc = classifier.batch_generate(
+    # classify(): exact multi-call completion scoring (gold-standard)
+    results_desc = classifier.batch_classify(
         texts=DATASET_WITH_DESCRIPTIONS.texts,
         choices=DATASET_WITH_DESCRIPTIONS.choices,
     )
-    for text, pred, expected in zip(
+    for text, result, expected in zip(
         DATASET_WITH_DESCRIPTIONS.texts,
-        predictions_desc,
+        results_desc,
         DATASET_WITH_DESCRIPTIONS.expected_labels,
     ):
-        mark = "✓" if pred == expected else "✗"
+        mark = "✓" if result.prediction == expected else "✗"
         print(f"  {mark} {text}")
-        print(f"    Predicted: {pred}  |  Expected: {expected}\n")
+        print(f"    Predicted: {result.prediction}  |  Expected: {expected}\n")
 
-    evaluate(predictions_desc, DATASET_WITH_DESCRIPTIONS.expected_labels)
+    evaluate(results_desc, DATASET_WITH_DESCRIPTIONS.expected_labels)
 
 
 if __name__ == "__main__":

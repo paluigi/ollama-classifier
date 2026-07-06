@@ -4,7 +4,7 @@ Installation
 Package Installation
 --------------------
 
-Install the core package (Ollama backend only):
+Install the package:
 
 .. code-block:: bash
 
@@ -16,17 +16,17 @@ Or with uv:
 
    uv add ollama-classifier
 
-Install with additional backends (vLLM, SGLang, llama.cpp):
+``httpx`` and ``pydantic`` are required dependencies and are installed
+automatically. The ``ollama`` Python SDK is **optional** — install it only
+if you use the Ollama backend:
 
 .. code-block:: bash
 
-   pip install "ollama-classifier[backends]"
+   pip install "ollama-classifier[ollama]"
 
-Or with uv:
-
-.. code-block:: bash
-
-   uv add "ollama-classifier[backends]"
+The vLLM, SGLang, and llama.cpp backends communicate over HTTP using
+``httpx`` (already a core dependency), so no extra install is needed for
+them.
 
 Prerequisites
 -------------

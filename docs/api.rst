@@ -3,8 +3,24 @@ API Reference
 
 This section provides the complete API reference for ollama-classifier.
 
+LLMClassifier
+-------------
+
+The single, unified, backend-agnostic classifier. Accepts any
+:class:`~ollama_classifier.backends.base.LLMBackend` instance and exposes
+two scoring methods: ``generate()`` (adaptive constrained generation) and
+``classify()`` (exact multi-call completion scoring).
+
+.. autoclass:: ollama_classifier.classifier.LLMClassifier
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :special-members: __init__
+
 ClassificationResult
 --------------------
+
+A Pydantic model returned by both ``generate()`` and ``classify()``.
 
 .. autoclass:: ollama_classifier.types.ClassificationResult
    :members:
@@ -16,28 +32,6 @@ ChoicesType
 
 .. autodata:: ollama_classifier.types.ChoicesType
 
-OllamaClassifier
------------------
-
-.. autoclass:: ollama_classifier.classifier.OllamaClassifier
-   :members:
-   :undoc-members:
-   :show-inheritance:
-   :special-members: __init__
-
-LLMClassifier
--------------
-
-The generic, backend-agnostic classifier. Accepts any
-:class:`~ollama_classifier.backends.base.LLMBackend` instance and
-exposes the same API as :class:`OllamaClassifier`.
-
-.. autoclass:: ollama_classifier.llm_classifier.LLMClassifier
-   :members:
-   :undoc-members:
-   :show-inheritance:
-   :special-members: __init__
-
 Backends
 --------
 
@@ -46,6 +40,11 @@ Backends
    :undoc-members:
 
 .. autoclass:: ollama_classifier.backends.base.LLMBackend
+   :members:
+   :show-inheritance:
+   :special-members: __init__
+
+.. autoclass:: ollama_classifier.backends.ollama.OllamaBackend
    :members:
    :show-inheritance:
    :special-members: __init__
@@ -68,32 +67,39 @@ Backends
 Method Summary
 --------------
 
-Both :class:`OllamaClassifier` and :class:`LLMClassifier` expose the
-same method set:
+:class:`LLMClassifier` exposes the following methods. All return a
+:class:`~ollama_classifier.types.ClassificationResult`.
 
-+-----------------------------------------------+------------------------+---------------------------------------------+
-| Method                                        | Async                  | Description                                 |
-+===============================================+========================+=============================================+
-| ``generate(text, choices, system_prompt)``    | ``agenerate``          | Constrained output only (fastest)           |
-+-----------------------------------------------+------------------------+---------------------------------------------+
-| ``classify(text, choices, system_prompt)``    | ``aclassify``          | Classification with calibrated confidence   |
-+-----------------------------------------------+------------------------+---------------------------------------------+
-| ``batch_generate(texts, choices, ...)``       | ``abatch_generate``    | Batch constrained output                    |
-+-----------------------------------------------+------------------------+---------------------------------------------+
-| ``batch_classify(texts, choices, ...)``       | ``abatch_classify``    | Batch classification                        |
-+-----------------------------------------------+------------------------+---------------------------------------------+
++----------------------------------------------------+------------------------+----------------------------------------------------------+
+| Method                                             | Async                  | Description                                              |
++====================================================+========================+==========================================================+
+| ``generate(text, choices, system_prompt, *,        | ``agenerate``          | Adaptive constrained generation (1 to ``max_calls``      |
+| max_calls)``                                       |                        | calls). ``method="adaptive_generate"``.                 |
++----------------------------------------------------+------------------------+----------------------------------------------------------+
+| ``classify(text, choices, system_prompt)``         | ``aclassify``          | Exact multi-call completion scoring (N calls for N       |
+|                                                    |                        | labels). ``method="multi_call"``.                        |
++----------------------------------------------------+------------------------+----------------------------------------------------------+
+| ``batch_generate(texts, choices, system_prompt,    | ``abatch_generate``    | Batch adaptive generation (parallelized).                |
+| *, max_calls)``                                    |                        |                                                          |
++----------------------------------------------------+------------------------+----------------------------------------------------------+
+| ``batch_classify(texts, choices, system_prompt)``  | ``abatch_classify``    | Batch multi-call classification (parallelized).          |
++----------------------------------------------------+------------------------+----------------------------------------------------------+
 
-Choosing a Method
------------------
+Choosing a Scoring Method
+-------------------------
 
 +------------------------------------------+--------------------------------------------------+
 | Use Case                                 | Recommended Method                               |
 +==========================================+==================================================+
-| Speed is critical, no confidence needed  | ``generate``                                     |
+| Speed is critical, approximate OK        | ``generate(max_calls=1)``                        |
 +------------------------------------------+--------------------------------------------------+
-| Accurate confidence scores               | ``classify``                                     |
+| Adaptive accuracy within a budget        | ``generate(max_calls=K)``                        |
 +------------------------------------------+--------------------------------------------------+
-| Batch processing                         | ``batch_classify``                               |
+| Fully resolved, unlimited calls          | ``generate(max_calls=None)``                     |
 +------------------------------------------+--------------------------------------------------+
-| Concurrent processing                    | Async variants (``aclassify``, etc.)             |
+| Gold-standard confidence (exact)         | ``classify``                                     |
++------------------------------------------+--------------------------------------------------+
+| Batch processing                         | ``batch_classify`` / ``batch_generate``          |
++------------------------------------------+--------------------------------------------------+
+| Concurrent processing                    | Async variants (``aclassify``, ``agenerate``)    |
 +------------------------------------------+--------------------------------------------------+
