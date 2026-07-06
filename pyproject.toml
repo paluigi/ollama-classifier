@@ -3,10 +3,20 @@ name = "ollama-classifier"
 version = "0.4.0"
 description = "Text classification with constrained output and confidence scoring across multiple LLM backends"
 readme = "README.md"
+license = "MIT"
+keywords = ["llm", "text-classification", "ollama", "vllm", "sglang", "llama.cpp"]
 authors = [
     {name = "Luigi Palumbo"},
     {name = "Mengting Yu"},
-    {name = "Carolina Camassa"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: General",
 ]
 requires-python = ">=3.11"
 dependencies = [
@@ -27,6 +37,12 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/paluigi/ollama-classifier"
+Repository = "https://github.com/paluigi/ollama-classifier"
+Issues = "https://github.com/paluigi/ollama-classifier/issues"
+Documentation = "https://ollama-classifier.readthedocs.io"
 
 [build-system]
 requires = ["uv_build>=0.9.26,<0.10.0"]
