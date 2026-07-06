@@ -1,46 +1,38 @@
-"""Ollama Classifier - A wrapper around Ollama Python SDK for text classification.
+"""Ollama Classifier - Text classification with constrained output and confidence scoring.
 
-This package provides classifiers for text classification with constrained
-output and confidence scoring using multiple inference backends.
+Supports multiple inference backends: Ollama (≥0.12), vLLM, SGLang, and llama.cpp.
 
-Ollama backend (original)::
+Two scoring methods:
 
-    from ollama import Client
-    from ollama_classifier import OllamaClassifier, ClassificationResult
+- ``generate()``: Adaptive constrained generation with divergence-aware
+  confidence. Budget-controlled via ``max_calls``.
+- ``classify()``: Multi-call completion scoring with geometric-mean
+  normalization. Gold-standard accuracy.
 
-    client = Client()
-    classifier = OllamaClassifier(client, model="llama3.2")
+Example::
 
-    result = classifier.classify(
-        text="I love this product!",
-        choices=["positive", "negative", "neutral"]
-    )
-    print(f"Prediction: {result.prediction}")
-    print(f"Confidence: {result.confidence:.2%}")
+    from ollama_classifier import LLMClassifier, ClassificationResult
+    from ollama_classifier.backends import OllamaBackend
 
-Generic backend (vLLM, SGLang, llama.cpp)::
-
-    from ollama_classifier.backends import VLLMBackend
-    from ollama_classifier import LLMClassifier
-
-    backend = VLLMBackend(model="meta-llama/Llama-3.2-3B-Instruct")
+    backend = OllamaBackend(model="llama3.2")
     classifier = LLMClassifier(backend)
 
     result = classifier.classify(
         text="I love this product!",
-        choices=["positive", "negative", "neutral"]
+        choices=["positive", "negative", "neutral"],
     )
+    print(f"Prediction: {result.prediction}")
+    print(f"Confidence: {result.confidence:.2%}")
+    print(f"Method: {result.method}")
 """
 
+from .classifier import LLMClassifier
 from .types import ClassificationResult, ChoicesType
-from .classifier import OllamaClassifier
-from .llm_classifier import LLMClassifier
 
 __all__ = [
-    "OllamaClassifier",
     "LLMClassifier",
     "ClassificationResult",
     "ChoicesType",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

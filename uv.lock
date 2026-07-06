@@ -362,15 +362,17 @@ wheels = [
 
 [[package]]
 name = "ollama-classifier"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
-    { name = "ollama" },
+    { name = "httpx" },
+    { name = "pydantic" },
 ]
 
 [package.optional-dependencies]
-backends = [
-    { name = "httpx" },
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -378,28 +380,22 @@ docs = [
     { name = "sphinx", version = "9.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "sphinx-rtd-theme" },
 ]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
+ollama = [
+    { name = "ollama" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx", marker = "extra == 'backends'", specifier = ">=0.27.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=2.0.0" },
-    { name = "ollama", specifier = ">=0.4.0" },
+    { name = "ollama", marker = "extra == 'ollama'", specifier = ">=0.4.0" },
+    { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "sphinx", marker = "extra == 'docs'", specifier = ">=7.0.0" },
     { name = "sphinx-rtd-theme", marker = "extra == 'docs'", specifier = ">=2.0.0" },
 ]
-provides-extras = ["backends", "docs"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "pytest-asyncio", specifier = ">=1.4.0" },
-]
+provides-extras = ["ollama", "docs", "dev"]
 
 [[package]]
 name = "packaging"

@@ -1,417 +1,555 @@
-"""Main classifier module for ollama-classifier."""
+"""Unified LLM classifier with adaptive scoring.
 
-import json
-import math
-from typing import Union, List, Dict, Any
+Provides :class:`LLMClassifier`, a backend-agnostic classifier with two
+confidence scoring methods:
 
-from ollama import Client, AsyncClient
+- **``generate()``** — Adaptive constrained generation with divergence-aware
+  confidence scoring. Budget-controlled via ``max_calls``. Ranges from 1 call
+  (approximate) to ≤N calls (exact). Uses a prefix trie over label tokens to
+  reconstruct per-label logprobs from constrained generation steps.
 
-from .types import ClassificationResult, ChoicesType
-from .prompts import (
-    build_classification_prompt,
-    get_choice_labels,
-    build_json_schema_for_choices,
+- **``classify()``** — Multi-call completion scoring with geometric-mean
+  normalization. Always exact. Makes N calls for N labels (parallelizable
+  via async).
+
+Example::
+
+    from ollama_classifier import LLMClassifier
+    from ollama_classifier.backends import OllamaBackend
+
+    backend = OllamaBackend(model="llama3.2")
+    classifier = LLMClassifier(backend)
+
+    result = classifier.classify(
+        text="I love this product!",
+        choices=["positive", "negative", "neutral"],
+    )
+    print(f"Prediction: {result.prediction} ({result.confidence:.2%})")
+"""
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List
+
+from .backends.base import ChatMessage, ChatResponse, LLMBackend, TokenLogprob
+from .prompts import build_classification_prompt, get_choice_labels
+from .scoring import (
+    Cluster,
+    LabelTrie,
+    divergence_point,
+    geometric_mean_logprob,
+    get_scored_lengths,
+    identify_unresolved_clusters,
+    score_labels_from_winning_path,
+    stable_softmax,
 )
+from .types import ClassificationResult, ChoicesType
 
 
-class OllamaClassifier:
-    """A classifier wrapper around Ollama client for text classification.
-    
-    This class provides methods for classifying text into a set of predefined choices
-    with calibrated probability scores using multi-call evaluation.
-    
-    Attributes:
-        _client: The Ollama client (sync or async).
-        _model: The model name to use for classification.
+class LLMClassifier:
+    """Backend-agnostic text classifier with two confidence scoring methods.
+
+    Methods:
+        generate(): Adaptive constrained generation with divergence-aware
+            confidence. Budget-controlled via ``max_calls``.
+        classify(): Multi-call completion scoring with geometric-mean
+            normalization. Always exact.
+
+    Args:
+        backend: An ``LLMBackend`` instance (e.g., ``OllamaBackend``,
+            ``VLLMBackend``, ``SGLangBackend``, or ``LlamaCppBackend``).
+        max_workers: Thread pool size for sync batch operations.
     """
-    
-    def __init__(self, client: Union[Client, AsyncClient], model: str):
-        """Initialize the classifier.
-        
-        Args:
-            client: An initialized Ollama Client or AsyncClient instance.
-            model: The model name to use for classification (e.g., "llama3.2").
-        """
-        self._client = client
-        self._model = model
-    
-    # =========================================================================
-    # Sync Methods - Generate
-    # =========================================================================
-    
+
+    def __init__(self, backend: LLMBackend, *, max_workers: int = 4):
+        self._backend = backend
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    # ==================================================================
+    # generate() — Adaptive trie-masked generation
+    # ==================================================================
+
     def generate(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
-    ) -> str:
-        """Generate a constrained classification for a single text.
-        
-        Uses JSON schema with enum constraint to ensure only valid choices are generated.
-        This is the fastest method as it only makes one API call and doesn't compute
-        confidence scores.
-        
+        *,
+        max_calls: int | None = 1,
+    ) -> ClassificationResult:
+        """Adaptive constrained classification with divergence-aware confidence.
+
+        Makes 1 to ``max_calls`` constrained API calls. Each call walks a prefix
+        trie of label tokens. After each call, labels are scored up to their
+        divergence point from the winning path. Unresolved clusters trigger
+        supplementary calls (recursive cluster resolution).
+
+        With ``max_calls=1``: single call, partial scoring (fast, approximate).
+        With ``max_calls=None``: resolves everything recursively (exact).
+
         Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
+            text: Text to classify.
+            choices: Labels as list or ``{label: description}`` dict.
             system_prompt: Optional custom system prompt.
-            
+            max_calls: Maximum number of API calls. ``None`` = unlimited.
+
         Returns:
-            The predicted choice label.
+            ``ClassificationResult`` with ``method="adaptive_generate"``.
         """
         labels = get_choice_labels(choices)
         system, user = build_classification_prompt(text, choices, system_prompt)
-        schema = build_json_schema_for_choices(labels)
-        
         messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            ChatMessage(role="system", content=system),
+            ChatMessage(role="user", content=user),
         ]
-        
-        response = self._client.chat(
-            model=self._model,
-            messages=messages,
-            format=schema,
-            options={"temperature": 0.0},
+
+        # 1. Tokenize labels in the backend's constraint context
+        token_context = self._get_token_context()
+        token_sequences = self._tokenize_labels(labels, token_context)
+
+        # 2. Build trie and determine required top_logprobs K
+        trie = LabelTrie()
+        for label, tokens in token_sequences.items():
+            trie.insert(label, tokens)
+        k = max(trie.max_branching_factor, 5)
+
+        # 3. Adaptive resolution loop
+        all_step_logprobs: dict[str, list[float]] = {
+            label: [] for label in labels
+        }
+        all_scored_lengths: dict[str, int] = {label: 0 for label in labels}
+        calls_made = 0
+
+        # First cluster: all labels
+        frontier: list[Cluster] = [Cluster(labels=list(labels), resolved_length=0)]
+
+        while frontier and (max_calls is None or calls_made < max_calls):
+            cluster = frontier.pop(0)  # BFS: breadth-first resolution
+            cluster_labels = cluster.labels
+            resolved_len = cluster.resolved_length
+
+            # Constrained call over this cluster
+            response = self._backend.chat(
+                messages=messages,
+                temperature=0.0,
+                constrain_labels=cluster_labels,
+                logprobs=True,
+                top_logprobs=k,
+            )
+            calls_made += 1
+
+            # Extract per-step top_logprobs (filtering structural tokens for Ollama)
+            step_lps = self._extract_step_logprobs(
+                response, token_sequences, cluster_labels
+            )
+
+            # Score labels in this cluster up to divergence point
+            winning_label = response.label
+            cluster_token_seqs = {l: token_sequences[l] for l in cluster_labels}
+
+            cluster_scores = score_labels_from_winning_path(
+                cluster_token_seqs, winning_label, step_lps
+            )
+            cluster_lengths = get_scored_lengths(cluster_token_seqs, winning_label)
+
+            for label in cluster_labels:
+                new_len = cluster_lengths[label]
+                if new_len > resolved_len:
+                    # Extract the newly scored token logprobs
+                    new_lps: list[float] = []
+                    for i in range(resolved_len, new_len):
+                        token = token_sequences[label][i]
+                        if i < len(step_lps) and token in step_lps[i]:
+                            new_lps.append(step_lps[i][token])
+                        else:
+                            new_lps.append(float("-inf"))
+                    all_step_logprobs[label].extend(new_lps)
+                    all_scored_lengths[label] = new_len
+
+            # Identify unresolved sub-clusters within this cluster
+            sub_clusters = identify_unresolved_clusters(
+                cluster_token_seqs, cluster_lengths
+            )
+            frontier.extend(sub_clusters)
+
+        # 4. Compute final scores from accumulated logprobs
+        raw_scores: dict[str, float] = {}
+        coverage: dict[str, float] = {}
+        for label in labels:
+            lps = all_step_logprobs[label]
+            total_tokens = len(token_sequences[label])
+            if lps:
+                raw_scores[label] = geometric_mean_logprob(lps)
+            else:
+                raw_scores[label] = float("-inf")
+            coverage[label] = len(lps) / total_tokens if total_tokens > 0 else 1.0
+
+        # 5. Softmax
+        probabilities = stable_softmax(raw_scores)
+        prediction = max(probabilities, key=probabilities.get)
+
+        # 6. Determine approximation flag
+        is_approximate = any(c < 1.0 for c in coverage.values())
+
+        return ClassificationResult(
+            prediction=prediction,
+            confidence=probabilities[prediction],
+            probabilities=probabilities,
+            method="adaptive_generate",
+            approximate=is_approximate,
+            coverage=coverage,
+            n_calls=calls_made,
+            raw_response={
+                "logprobs": raw_scores,
+                "token_sequences": token_sequences,
+                "step_logprobs": all_step_logprobs,
+                "scored_lengths": all_scored_lengths,
+            },
         )
-        
-        result = json.loads(response.message.content)
-        return result.get("label", "")
-    
-    def batch_generate(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[str]:
-        """Generate constrained classifications for multiple texts.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of predicted choice labels, one per input text.
+
+    def _get_token_context(self) -> str | None:
+        """Get the tokenization context for this backend.
+
+        For backends that generate bare labels (vLLM, SGLang, llama.cpp),
+        context is ``None`` — labels are tokenized standalone.
+
+        For Ollama (JSON enum wrapper), context is the JSON prefix that
+        precedes the label in the response: ``'{"label": "'``.
         """
-        return [self.generate(text, choices, system_prompt) for text in texts]
-    
-    # =========================================================================
-    # Sync Methods - Classify (Multi-call evaluation with softmax)
-    # =========================================================================
-    
+        if self._backend.supports_bare_label_constraint:
+            return None
+        else:
+            return '{"label": "'
+
+    def _tokenize_labels(
+        self,
+        labels: list[str],
+        token_context: str | None,
+    ) -> dict[str, list[str]]:
+        """Tokenize each label in the appropriate context.
+
+        For bare-label backends, tokenizes standalone label text.
+        For Ollama, tokenizes label within the JSON prefix context.
+        """
+        token_sequences: dict[str, list[str]] = {}
+        for label in labels:
+            tokens = self._backend.tokenize(label, context=token_context)
+            token_sequences[label] = [
+                t.text if t.text else f"token_{t.id}" for t in tokens
+            ]
+        return token_sequences
+
+    def _extract_step_logprobs(
+        self,
+        response: ChatResponse,
+        token_sequences: dict[str, list[str]],
+        cluster_labels: list[str],
+    ) -> list[dict[str, float]]:
+        """Extract per-step top_logprobs from a constrained call response.
+
+        For bare-label backends, the response contains only label tokens.
+        For Ollama (JSON wrapper), structural tokens are filtered by matching
+        against known label tokens.
+        """
+        if not response.logprobs:
+            return []
+
+        # Collect all valid label tokens for filtering
+        valid_tokens: set[str] = set()
+        for label in cluster_labels:
+            valid_tokens.update(token_sequences[label])
+
+        step_lps: list[dict[str, float]] = []
+        for tlp in response.logprobs:
+            # Filter top_logprobs to only include valid label tokens
+            filtered = {
+                tok: lp for tok, lp in tlp.top_logprobs.items()
+                if tok in valid_tokens
+            }
+            if filtered:
+                step_lps.append(filtered)
+        return step_lps
+
+    # ==================================================================
+    # classify() — Multi-call completion scoring
+    # ==================================================================
+
     def classify(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Classify text using multi-call evaluation with softmax.
+        """Multi-call classification with geometric-mean completion scoring.
 
-        Makes separate API calls for each choice to compute log P(choice|context),
-        then applies softmax for calibrated probabilities.
-        This makes N API calls for N choices.
-        
+        For each label, scores the label as a completion of the prompt and
+        extracts per-token logprobs WITHOUT generation. Applies geometric-mean
+        normalization to eliminate token-count bias. This is the gold-standard
+        confidence method.
+
+        Makes N API calls for N choices (parallelizable via async).
+
         Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
+            text: Text to classify.
+            choices: Labels as list or ``{label: description}`` dict.
             system_prompt: Optional custom system prompt.
-            
+
         Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
+            ``ClassificationResult`` with ``method="multi_call"``,
+            ``approximate=False``.
         """
         labels = get_choice_labels(choices)
         system, user = build_classification_prompt(text, choices, system_prompt)
-        
-        # Compute logprob for each choice
-        logprobs: Dict[str, float] = {}
+        messages = [
+            ChatMessage(role="system", content=system),
+            ChatMessage(role="user", content=user),
+        ]
+
+        raw_scores: dict[str, float] = {}
+        logprob_details: dict[str, list[float]] = {}
+
         for label in labels:
-            logprobs[label] = self._get_choice_logprob(
-                system, user, label
-            )
-        
-        # Apply softmax to get probabilities
-        probabilities = self._softmax(logprobs)
-        
-        # Get prediction (highest probability)
+            scoring = self._backend.score(messages, label)
+            token_lps = [tlp.logprob for tlp in scoring.logprobs]
+            if token_lps:
+                raw_scores[label] = geometric_mean_logprob(token_lps)
+            else:
+                raw_scores[label] = float("-inf")
+            logprob_details[label] = token_lps
+
+        probabilities = stable_softmax(raw_scores)
         prediction = max(probabilities, key=probabilities.get)
-        
+
         return ClassificationResult(
             prediction=prediction,
             confidence=probabilities[prediction],
             probabilities=probabilities,
-            raw_response={"logprobs": logprobs},
+            method="multi_call",
+            approximate=False,
+            n_calls=len(labels),
+            raw_response={
+                "logprobs": raw_scores,
+                "token_logprobs": logprob_details,
+            },
         )
-    
+
+    # ==================================================================
+    # Batch methods (parallelized)
+    # ==================================================================
+
+    def batch_generate(
+        self,
+        texts: List[str],
+        choices: ChoicesType,
+        system_prompt: str | None = None,
+        *,
+        max_calls: int | None = 1,
+    ) -> List[ClassificationResult]:
+        """Batch adaptive generation (parallelized via ``ThreadPoolExecutor``)."""
+        return list(
+            self._executor.map(
+                lambda t: self.generate(t, choices, system_prompt, max_calls=max_calls),
+                texts,
+            )
+        )
+
     def batch_classify(
         self,
         texts: List[str],
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> List[ClassificationResult]:
-        """Classify multiple texts with calibrated confidence scores.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        return [self.classify(text, choices, system_prompt) for text in texts]
-    
-    # =========================================================================
-    # Async Methods - Generate
-    # =========================================================================
-    
+        """Batch multi-call classification (parallelized via ``ThreadPoolExecutor``)."""
+        return list(
+            self._executor.map(
+                lambda t: self.classify(t, choices, system_prompt), texts
+            )
+        )
+
+    # ==================================================================
+    # Async methods
+    # ==================================================================
+
     async def agenerate(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
-    ) -> str:
-        """Async version of generate().
-        
-        Generate a constrained classification for a single text.
-        
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            The predicted choice label.
-        """
+        *,
+        max_calls: int | None = 1,
+    ) -> ClassificationResult:
+        """Async adaptive generation with divergence-aware confidence."""
         labels = get_choice_labels(choices)
         system, user = build_classification_prompt(text, choices, system_prompt)
-        schema = build_json_schema_for_choices(labels)
-        
         messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            ChatMessage(role="system", content=system),
+            ChatMessage(role="user", content=user),
         ]
-        
-        response = await self._client.chat(
-            model=self._model,
-            messages=messages,
-            format=schema,
-            options={"temperature": 0.0},
+
+        token_context = self._get_token_context()
+
+        # Tokenize labels concurrently
+        token_tasks = [
+            self._backend.atokenize(label, context=token_context) for label in labels
+        ]
+        token_results = await asyncio.gather(*token_tasks)
+        token_sequences = {
+            label: [t.text if t.text else f"token_{t.id}" for t in tokens]
+            for label, tokens in zip(labels, token_results)
+        }
+
+        trie = LabelTrie()
+        for label, tokens in token_sequences.items():
+            trie.insert(label, tokens)
+        k = max(trie.max_branching_factor, 5)
+
+        all_step_logprobs: dict[str, list[float]] = {
+            label: [] for label in labels
+        }
+        all_scored_lengths: dict[str, int] = {label: 0 for label in labels}
+        calls_made = 0
+
+        frontier: list[Cluster] = [Cluster(labels=list(labels), resolved_length=0)]
+
+        while frontier and (max_calls is None or calls_made < max_calls):
+            cluster = frontier.pop(0)
+            cluster_labels = cluster.labels
+            resolved_len = cluster.resolved_length
+
+            response = await self._backend.achat(
+                messages=messages,
+                temperature=0.0,
+                constrain_labels=cluster_labels,
+                logprobs=True,
+                top_logprobs=k,
+            )
+            calls_made += 1
+
+            step_lps = self._extract_step_logprobs(
+                response, token_sequences, cluster_labels
+            )
+
+            winning_label = response.label
+            cluster_token_seqs = {l: token_sequences[l] for l in cluster_labels}
+
+            cluster_scores = score_labels_from_winning_path(
+                cluster_token_seqs, winning_label, step_lps
+            )
+            cluster_lengths = get_scored_lengths(cluster_token_seqs, winning_label)
+
+            for label in cluster_labels:
+                new_len = cluster_lengths[label]
+                if new_len > resolved_len:
+                    new_lps: list[float] = []
+                    for i in range(resolved_len, new_len):
+                        token = token_sequences[label][i]
+                        if i < len(step_lps) and token in step_lps[i]:
+                            new_lps.append(step_lps[i][token])
+                        else:
+                            new_lps.append(float("-inf"))
+                    all_step_logprobs[label].extend(new_lps)
+                    all_scored_lengths[label] = new_len
+
+            sub_clusters = identify_unresolved_clusters(
+                cluster_token_seqs, cluster_lengths
+            )
+            frontier.extend(sub_clusters)
+
+        raw_scores: dict[str, float] = {}
+        coverage: dict[str, float] = {}
+        for label in labels:
+            lps = all_step_logprobs[label]
+            total_tokens = len(token_sequences[label])
+            if lps:
+                raw_scores[label] = geometric_mean_logprob(lps)
+            else:
+                raw_scores[label] = float("-inf")
+            coverage[label] = len(lps) / total_tokens if total_tokens > 0 else 1.0
+
+        probabilities = stable_softmax(raw_scores)
+        prediction = max(probabilities, key=probabilities.get)
+        is_approximate = any(c < 1.0 for c in coverage.values())
+
+        return ClassificationResult(
+            prediction=prediction,
+            confidence=probabilities[prediction],
+            probabilities=probabilities,
+            method="adaptive_generate",
+            approximate=is_approximate,
+            coverage=coverage,
+            n_calls=calls_made,
+            raw_response={
+                "logprobs": raw_scores,
+                "token_sequences": token_sequences,
+            },
         )
-        
-        result = json.loads(response.message.content)
-        return result.get("label", "")
-    
-    async def abatch_generate(
-        self,
-        texts: List[str],
-        choices: ChoicesType,
-        system_prompt: str | None = None,
-    ) -> List[str]:
-        """Async version of batch_generate().
-        
-        Generate constrained classifications for multiple texts.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of predicted choice labels, one per input text.
-        """
-        import asyncio
-        return await asyncio.gather(*[
-            self.agenerate(text, choices, system_prompt) for text in texts
-        ])
-    
-    # =========================================================================
-    # Async Methods - Classify
-    # =========================================================================
-    
+
     async def aclassify(
         self,
         text: str,
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> ClassificationResult:
-        """Async version of classify().
-
-        Classify text using multi-call evaluation with softmax.
-        Computes logprobs concurrently for all choices.
-        
-        Args:
-            text: The text to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            ClassificationResult with prediction, confidence, and probabilities.
-        """
-        import asyncio
-        
+        """Async multi-call classification (labels scored concurrently)."""
         labels = get_choice_labels(choices)
         system, user = build_classification_prompt(text, choices, system_prompt)
-        
-        # Compute logprob for each choice concurrently
-        logprobs_tasks = [
-            self._aget_choice_logprob(system, user, label)
-            for label in labels
+        messages = [
+            ChatMessage(role="system", content=system),
+            ChatMessage(role="user", content=user),
         ]
-        logprob_values = await asyncio.gather(*logprobs_tasks)
-        
-        logprobs = dict(zip(labels, logprob_values))
-        
-        # Apply softmax to get probabilities
-        probabilities = self._softmax(logprobs)
-        
-        # Get prediction (highest probability)
+
+        score_tasks = [self._backend.ascore(messages, label) for label in labels]
+        scoring_results = await asyncio.gather(*score_tasks)
+
+        raw_scores: dict[str, float] = {}
+        logprob_details: dict[str, list[float]] = {}
+        for label, scoring in zip(labels, scoring_results):
+            token_lps = [tlp.logprob for tlp in scoring.logprobs]
+            if token_lps:
+                raw_scores[label] = geometric_mean_logprob(token_lps)
+            else:
+                raw_scores[label] = float("-inf")
+            logprob_details[label] = token_lps
+
+        probabilities = stable_softmax(raw_scores)
         prediction = max(probabilities, key=probabilities.get)
-        
+
         return ClassificationResult(
             prediction=prediction,
             confidence=probabilities[prediction],
             probabilities=probabilities,
-            raw_response={"logprobs": logprobs},
+            method="multi_call",
+            approximate=False,
+            n_calls=len(labels),
+            raw_response={
+                "logprobs": raw_scores,
+                "token_logprobs": logprob_details,
+            },
         )
-    
+
+    async def abatch_generate(
+        self,
+        texts: List[str],
+        choices: ChoicesType,
+        system_prompt: str | None = None,
+        *,
+        max_calls: int | None = 1,
+    ) -> List[ClassificationResult]:
+        """Async batch adaptive generation."""
+        return await asyncio.gather(
+            *[
+                self.agenerate(t, choices, system_prompt, max_calls=max_calls)
+                for t in texts
+            ]
+        )
+
     async def abatch_classify(
         self,
         texts: List[str],
         choices: ChoicesType,
         system_prompt: str | None = None,
     ) -> List[ClassificationResult]:
-        """Async version of batch_classify().
-        
-        Classify multiple texts with calibrated confidence scores.
-        
-        Args:
-            texts: List of texts to classify.
-            choices: Either a list of choice labels, or a dict mapping labels to descriptions.
-            system_prompt: Optional custom system prompt.
-            
-        Returns:
-            List of ClassificationResults, one per input text.
-        """
-        import asyncio
-        return await asyncio.gather(*[
-            self.aclassify(text, choices, system_prompt) for text in texts
-        ])
-    
-    # =========================================================================
-    # Private Helper Methods
-    # =========================================================================
-
-    def _get_choice_logprob(
-        self,
-        system: str,
-        user: str,
-        choice: str,
-    ) -> float:
-        """Compute a log-probability for a single choice.
-
-        Generates a response with a single-value schema that forces the model
-        to output ``choice`` and returns the sum of logprobs of all generated
-        tokens.  This gives a value proportional to how naturally the model
-        produces that choice given the context; applying softmax across all
-        choices yields calibrated probabilities.
-
-        Args:
-            system: System prompt.
-            user: User prompt.
-            choice: The choice label to evaluate.
-
-        Returns:
-            Sum of token logprobs for the forced-choice generation.
-        """
-        forced_schema = {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string", "enum": [choice]},
-            },
-            "required": ["label"],
-        }
-
-        response = self._client.chat(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            format=forced_schema,
-            logprobs=True,
-            options={"temperature": 0.0},
+        """Async batch multi-call classification."""
+        return await asyncio.gather(
+            *[self.aclassify(t, choices, system_prompt) for t in texts]
         )
-
-        if response.logprobs:
-            return sum(lp.logprob for lp in response.logprobs)
-        return 0.0
-
-    async def _aget_choice_logprob(
-        self,
-        system: str,
-        user: str,
-        choice: str,
-    ) -> float:
-        """Async version of _get_choice_logprob().
-
-        Compute a log-probability for a single choice.
-
-        Args:
-            system: System prompt.
-            user: User prompt.
-            choice: The choice label to evaluate.
-
-        Returns:
-            Sum of token logprobs for the forced-choice generation.
-        """
-        forced_schema = {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string", "enum": [choice]},
-            },
-            "required": ["label"],
-        }
-
-        response = await self._client.chat(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            format=forced_schema,
-            logprobs=True,
-            options={"temperature": 0.0},
-        )
-
-        if response.logprobs:
-            return sum(lp.logprob for lp in response.logprobs)
-        return 0.0
-
-    def _softmax(self, logprobs: Dict[str, float]) -> Dict[str, float]:
-        """Apply numerically stable softmax to log probabilities.
-        
-        Args:
-            logprobs: Dict mapping labels to log probabilities.
-            
-        Returns:
-            Dict mapping labels to probabilities (summing to 1.0).
-        """
-        # Filter out -inf values for computation
-        valid_logprobs = {k: v for k, v in logprobs.items() if v > float("-inf")}
-        
-        if not valid_logprobs:
-            # If all are -inf, return uniform distribution
-            n = len(logprobs)
-            return {k: 1.0 / n for k in logprobs}
-        
-        max_lp = max(valid_logprobs.values())
-        exp_vals = {k: math.exp(v - max_lp) if v > float("-inf") else 0.0 
-                    for k, v in logprobs.items()}
-        total = sum(exp_vals.values())
-        
-        if total == 0:
-            n = len(logprobs)
-            return {k: 1.0 / n for k in logprobs}
-        
-        return {k: v / total for k, v in exp_vals.items()}

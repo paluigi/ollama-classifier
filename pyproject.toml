@@ -1,7 +1,7 @@
 [project]
 name = "ollama-classifier"
-version = "0.3.0"
-description = "A wrapper around Ollama Python SDK for text classification with constrained output and confidence scoring"
+version = "0.4.0"
+description = "Text classification with constrained output and confidence scoring across multiple LLM backends"
 readme = "README.md"
 authors = [
     {name = "Luigi Palumbo"},
@@ -10,25 +10,27 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "ollama>=0.4.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]
-backends = [
-    "httpx>=0.27.0",
+ollama = [
+    "ollama>=0.4.0",
 ]
 docs = [
     "sphinx>=7.0.0",
     "sphinx-rtd-theme>=2.0.0",
     "myst-parser>=2.0.0",
 ]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.26,<0.10.0"]
 build-backend = "uv_build"
 
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
