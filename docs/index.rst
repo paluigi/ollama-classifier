@@ -3,7 +3,10 @@
 Welcome to ollama-classifier's documentation!
 =============================================
 
-A Python wrapper around the Ollama Python SDK for text classification with constrained output and confidence scoring. **Supports multiple inference backends**: Ollama, vLLM, SGLang, and llama.cpp.
+A Python library for LLM-based text classification with constrained output
+and confidence scoring. **Supports multiple inference backends**: Ollama
+(≥0.12), vLLM, SGLang, and llama.cpp — all behind a single unified
+:class:`~ollama_classifier.classifier.LLMClassifier`.
 
 .. toctree::
    :maxdepth: 2
@@ -18,10 +21,11 @@ A Python wrapper around the Ollama Python SDK for text classification with const
 Features
 --------
 
-- **Constrained Output**: Uses JSON schema with enum constraints to ensure only valid choices are generated
-- **Confidence Scoring**: Multi-call evaluation with softmax for calibrated probabilities
+- **Two Scoring Methods**: ``generate()`` for adaptive budget-controlled scoring, ``classify()`` for exact gold-standard confidence
+- **Constrained Output**: Output is guaranteed to be one of your labels (JSON enum, ``guided_choice``, regex, or GBNF — depending on backend)
+- **Calibrated Confidence**: Probability distribution over all choices with geometric-mean normalization (no token-count bias)
 - **Sync & Async**: Full support for both synchronous and asynchronous operations
-- **Batch Processing**: Classify multiple texts efficiently
+- **Batch Processing**: Classify multiple texts efficiently with parallel execution
 - **Flexible Choices**: Support for simple labels or labels with descriptions
 - **Custom Prompts**: Override the default system prompt for specialized tasks
 - **Multiple Backends**: Use Ollama, vLLM, SGLang, or llama.cpp as your inference engine
@@ -29,15 +33,18 @@ Features
 Quick Start
 -----------
 
-**Ollama** (default backend):
+All backends follow the same pattern: create a backend, wrap it in an
+``LLMClassifier``, and call ``generate()`` or ``classify()``.
+
+**Ollama** backend:
 
 .. code-block:: python
 
-   from ollama import Client
-   from ollama_classifier import OllamaClassifier
+   from ollama_classifier import LLMClassifier
+   from ollama_classifier.backends import OllamaBackend
 
-   client = Client()
-   classifier = OllamaClassifier(client, model="llama3.2")
+   backend = OllamaBackend(model="llama3.2")
+   classifier = LLMClassifier(backend)
 
    result = classifier.classify(
        text="I love this product!",
@@ -51,8 +58,8 @@ Quick Start
 
 .. code-block:: python
 
-   from ollama_classifier.backends import VLLMBackend
    from ollama_classifier import LLMClassifier
+   from ollama_classifier.backends import VLLMBackend
 
    backend = VLLMBackend(model="meta-llama/Llama-3.2-3B-Instruct")
    classifier = LLMClassifier(backend)

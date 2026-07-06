@@ -3,26 +3,35 @@ Usage
 
 This section covers the common usage patterns for ollama-classifier.
 
-Basic Classification
---------------------
-
-The simplest way to classify text:
+Every backend is used the same way: instantiate a backend, wrap it in an
+:class:`~ollama_classifier.classifier.LLMClassifier`, and call
+``generate()`` or ``classify()``.
 
 .. code-block:: python
 
-   from ollama import Client
-   from ollama_classifier import OllamaClassifier
+   from ollama_classifier import LLMClassifier
+   from ollama_classifier.backends import OllamaBackend
 
-   client = Client()
-   classifier = OllamaClassifier(client, model="llama3.2")
+   backend = OllamaBackend(model="llama3.2")
+   classifier = LLMClassifier(backend)
+
+Basic Classification
+--------------------
+
+The simplest way to classify text. ``classify()`` makes one completion-scoring
+call per label and returns calibrated confidence via geometric-mean
+normalization.
+
+.. code-block:: python
 
    result = classifier.classify(
        text="The goalkeeper made an incredible save!",
-       choices=["sports", "politics", "technology", "entertainment"]
+       choices=["sports", "politics", "technology", "entertainment"],
    )
 
    print(f"Prediction: {result.prediction}")
    print(f"Confidence: {result.confidence:.2%}")
+   print(f"Method: {result.method}")  # "multi_call"
 
 Classification with Label Descriptions
 --------------------------------------
@@ -40,7 +49,7 @@ Providing descriptions helps the model understand each category better:
 
    result = classifier.classify(
        text="The food was amazing but the service was terrible.",
-       choices=choices
+       choices=choices,
    )
 
 Custom System Prompt
@@ -57,35 +66,98 @@ Override the default system prompt for specialized tasks:
                      "Classify financial news based on market sentiment."
    )
 
-Classification with Confidence Scores (Multi-Call with Softmax)
----------------------------------------------------------------
+Choosing a Scoring Method
+-------------------------
 
-Get calibrated probability distribution over all choices.
-Makes N API calls for N choices:
+``LLMClassifier`` provides two scoring methods. Each returns a
+:class:`~ollama_classifier.types.ClassificationResult` with a full
+probability distribution.
+
++-------------------+-----------------------------------------------------+-------------------------------------------------------------+
+|                   | ``generate()``                                      | ``classify()``                                              |
++===================+=====================================================+=============================================================+
+| How it works      | Adaptive constrained generation over a prefix trie  | Multi-call completion scoring: each label scored as a       |
+|                   | of label tokens; per-label logprobs reconstructed   | completion of the prompt without generation.                |
+|                   | from the winning path and unresolved clusters.      |                                                             |
++-------------------+-----------------------------------------------------+-------------------------------------------------------------+
+| API calls         | 1 to ``max_calls`` (adaptive)                       | N calls for N labels                                        |
++-------------------+-----------------------------------------------------+-------------------------------------------------------------+
+| Confidence        | Divergence-aware (may be partial for labels that    | Exact (geometric-mean normalization)                        |
+|                   | diverge early from the winning path)                |                                                             |
++-------------------+-----------------------------------------------------+-------------------------------------------------------------+
+| Approximate?      | ``result.approximate`` is ``True`` when any label   | Always ``False`` — fully resolved                           |
+|                   | has partial coverage                                |                                                             |
++-------------------+-----------------------------------------------------+-------------------------------------------------------------+
+| ``result.method`` | ``"adaptive_generate"``                             | ``"multi_call"``                                            |
++-------------------+-----------------------------------------------------+-------------------------------------------------------------+
+| Best for          | Speed, large label sets, when a single call         | Gold-standard accuracy, small-to-medium label sets          |
+|                   | suffices                                            |                                                             |
++-------------------+-----------------------------------------------------+-------------------------------------------------------------+
+
+Adaptive Generation (``generate``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``generate()`` makes 1 to ``max_calls`` constrained API calls. Each call walks
+a prefix trie of label tokens. After each call, labels are scored up to their
+divergence point from the winning path. Unresolved clusters trigger
+supplementary calls (recursive cluster resolution) until the budget is
+exhausted.
+
+The ``max_calls`` parameter controls the accuracy/cost tradeoff:
+
++---------------------+-----------------------------------------------------------+---------+
+| ``max_calls``       | Behavior                                                  | Calls   |
++=====================+===========================================================+=========+
+| ``1`` *(default)*   | Single constrained call. Labels are scored up to their    | 1       |
+|                     | divergence point. Fast but approximate.                   |         |
++---------------------+-----------------------------------------------------------+---------+
+| ``K``               | Adaptive resolution. Unresolved label clusters trigger    | ≤ K     |
+|                     | supplementary calls until the budget is exhausted.        |         |
++---------------------+-----------------------------------------------------------+---------+
+| ``None``            | Fully recursive resolution. Every cluster is resolved to  | ≤ N     |
+|                     | completion. Equivalent to exact scoring.                  |         |
++---------------------+-----------------------------------------------------------+---------+
+
+.. code-block:: python
+
+   # Fast: single call, approximate confidence
+   result = classifier.generate(
+       text="The team won the championship!",
+       choices=["sports", "finance", "politics"],
+       max_calls=1,
+   )
+   print(result.prediction)   # "sports"
+   print(result.approximate)  # True (if any label had partial coverage)
+   print(result.coverage)     # {"sports": 1.0, "finance": 1.0, "politics": 1.0}
+
+   # Adaptive: allow up to 3 calls for better resolution
+   result = classifier.generate(text="...", choices=[...], max_calls=3)
+
+   # Exact: resolve everything (unlimited calls)
+   result = classifier.generate(text="...", choices=[...], max_calls=None)
+
+Multi-Call Scoring (``classify``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Makes one completion-scoring call per label. Each label's per-token logprobs
+are extracted *without generation*, then normalized via geometric mean to
+eliminate token-count bias. This is the gold-standard confidence method.
 
 .. code-block:: python
 
    result = classifier.classify(
        text="The movie was fantastic!",
-       choices=["positive", "negative", "neutral"]
+       choices=["positive", "negative", "neutral"],
    )
+   print(result.method)        # "multi_call"
+   print(result.approximate)   # False
+   print(result.n_calls)       # 3
 
-Generate Only (Fastest)
------------------------
+Batch Processing
+----------------
 
-When you only need the prediction without confidence scores:
-
-.. code-block:: python
-
-   prediction = classifier.generate(
-       text="The team won the championship!",
-       choices=["sports", "finance", "politics"]
-   )
-
-Batch Classification
---------------------
-
-Classify multiple texts efficiently:
+Classify multiple texts efficiently. Batch methods are parallelized via a
+thread pool (sync) or ``asyncio.gather`` (async):
 
 .. code-block:: python
 
@@ -97,7 +169,7 @@ Classify multiple texts efficiently:
 
    results = classifier.batch_classify(
        texts=texts,
-       choices=["sports", "finance", "technology"]
+       choices=["sports", "finance", "technology"],
    )
 
    for text, result in zip(texts, results):
@@ -111,23 +183,23 @@ For concurrent processing, use the async methods:
 .. code-block:: python
 
    import asyncio
-   from ollama import AsyncClient
-   from ollama_classifier import OllamaClassifier
+   from ollama_classifier import LLMClassifier
+   from ollama_classifier.backends import OllamaBackend
 
    async def main():
-       client = AsyncClient()
-       classifier = OllamaClassifier(client, model="llama3.2")
-       
+       backend = OllamaBackend(model="llama3.2")
+       classifier = LLMClassifier(backend)
+
        # Single classification
        result = await classifier.aclassify(
            text="The concert was amazing!",
-           choices=["positive", "negative", "neutral"]
+           choices=["positive", "negative", "neutral"],
        )
-       
+
        # Batch classification (concurrent)
        results = await classifier.abatch_classify(
            texts=["Text 1", "Text 2", "Text 3"],
-           choices=["positive", "negative", "neutral"]
+           choices=["positive", "negative", "neutral"],
        )
 
    asyncio.run(main())
@@ -141,7 +213,7 @@ The :class:`~ollama_classifier.types.ClassificationResult` object contains:
 
    result = classifier.classify(
        text="I love this product!",
-       choices=["positive", "negative", "neutral"]
+       choices=["positive", "negative", "neutral"],
    )
 
    # The predicted label
@@ -151,10 +223,22 @@ The :class:`~ollama_classifier.types.ClassificationResult` object contains:
    print(result.confidence)  # 0.92
 
    # Full probability distribution
-   print(result.probabilities)  
+   print(result.probabilities)
    # {"positive": 0.92, "negative": 0.05, "neutral": 0.03}
 
-   # Raw response for debugging
+   # Scoring method used
+   print(result.method)  # "multi_call" or "adaptive_generate"
+
+   # Whether the result is approximate (only for generate())
+   print(result.approximate)  # False for classify()
+
+   # Per-label fraction of tokens scored (only for generate())
+   print(result.coverage)  # {"positive": 1.0, ...}
+
+   # Number of API calls made
+   print(result.n_calls)  # 3
+
+   # Raw data for debugging
    print(result.raw_response)
 
 Using Sample Data
@@ -187,45 +271,21 @@ Quick test with the basic dataset:
 
 .. code-block:: python
 
-   from ollama import Client
-   from ollama_classifier import OllamaClassifier
+   from ollama_classifier import LLMClassifier
+   from ollama_classifier.backends import OllamaBackend
    from examples.sample_data import DATASET_WITHOUT_DESCRIPTIONS
 
-   client = Client()
-   classifier = OllamaClassifier(client, model="llama3.2")
+   backend = OllamaBackend(model="llama3.2")
+   classifier = LLMClassifier(backend)
 
-   predictions = classifier.batch_generate(
+   results = classifier.batch_generate(
        texts=DATASET_WITHOUT_DESCRIPTIONS.texts,
        choices=DATASET_WITHOUT_DESCRIPTIONS.choices,
    )
 
-   correct = sum(p == e for p, e in
-                   zip(predictions, DATASET_WITHOUT_DESCRIPTIONS.expected_labels))
-   print(f"Accuracy: {correct}/{len(predictions)}")
-
-Comparing with and without descriptions:
-
-.. code-block:: python
-
-   from examples.sample_data import (
-       DATASET_WITHOUT_DESCRIPTIONS,
-       DATASET_WITH_DESCRIPTIONS,
-   )
-
-   preds_simple = classifier.batch_generate(
-       texts=DATASET_WITHOUT_DESCRIPTIONS.texts,
-       choices=DATASET_WITHOUT_DESCRIPTIONS.choices,
-   )
-
-   preds_desc = classifier.batch_generate(
-       texts=DATASET_WITH_DESCRIPTIONS.texts,
-       choices=DATASET_WITH_DESCRIPTIONS.choices,
-   )
-
-   print(f"Without descriptions: "
-         f"{sum(p == e for p, e in zip(preds_simple, DATASET_WITHOUT_DESCRIPTIONS.expected_labels))}/{len(preds_simple)}")
-   print(f"With descriptions:    "
-         f"{sum(p == e for p, e in zip(preds_desc, DATASET_WITH_DESCRIPTIONS.expected_labels))}/{len(preds_desc)}")
+   correct = sum(r.prediction == e for r, e in
+                   zip(results, DATASET_WITHOUT_DESCRIPTIONS.expected_labels))
+   print(f"Accuracy: {correct}/{len(results)}")
 
 Run the bundled example script directly:
 
