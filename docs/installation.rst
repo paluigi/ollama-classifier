@@ -35,11 +35,21 @@ Before using ollama-classifier, you need at least one inference backend:
 
 **Ollama backend**
 
-1. **Ollama installed and running**
+1. **Ollama ≥0.12 installed and running**
 
    Download and install Ollama from: https://ollama.com/download
 
-2. **A model pulled**
+   .. note::
+
+      Ollama runtime **v0.12 or later** is required for logprobs support.
+
+2. **The Ollama Python SDK** (optional dependency):
+
+   .. code-block:: bash
+
+      pip install "ollama-classifier[ollama]"
+
+3. **A model pulled**
 
    Pull a model to use for classification:
 
@@ -97,7 +107,7 @@ To contribute to the project or run the documentation locally:
 
    git clone https://github.com/paluigi/ollama-classifier.git
    cd ollama-classifier
-   uv sync --extra docs --extra backends
+   uv sync --extra docs --extra ollama
 
 Building Documentation Locally
 ------------------------------
