@@ -276,7 +276,7 @@ asyncio.run(main())
 
 ### Ollama
 
-Uses the Ollama Python SDK. Constraint mechanism: **JSON Schema enum** via the `format` parameter (the model generates `{"label": "<chosen>"}`). Requires Ollama runtime ≥0.12 for logprobs.
+Uses the Ollama Python SDK. Constraint mechanism: **JSON Schema enum** via the `format` parameter (the model generates `{"label": "<chosen>"}`). Requires Ollama runtime ≥0.12 for logprobs. Since modern Ollama removed `/api/tokenize` and never supported insert on instruct models, both tokenization and completion scoring use empirical forced constrained generation (forcing a label as the only valid choice).
 
 ```python
 from ollama_classifier import LLMClassifier

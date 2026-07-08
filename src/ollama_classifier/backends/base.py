@@ -153,11 +153,12 @@ class LLMBackend(ABC):
         messages: List[ChatMessage],
         completion: str,
     ) -> ScoringResponse:
-        """Score a completion by computing per-token logprobs of the
-        completion text given the message context.
+        """Score a completion by extracting per-token logprobs.
 
-        No generation occurs — the completion is provided and the backend
-        returns the model's logprob for each token of the completion.
+        The completion is forced as the only valid label (teacher forcing)
+        via a constrained generation call, and the model's genuine per-token
+        logprobs are read back. The exact mechanism is backend-specific
+        (forced constrained ``chat()``, echo-based prefill, etc.).
 
         Args:
             messages: The chat messages forming the context.

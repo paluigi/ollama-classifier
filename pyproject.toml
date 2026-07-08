@@ -1,6 +1,6 @@
 [project]
 name = "ollama-classifier"
-version = "0.4.1"
+version = "0.5.0"
 description = "Text classification with constrained output and confidence scoring across multiple LLM backends"
 readme = "README.md"
 license = "MIT"
@@ -50,3 +50,7 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Only the unit tests in tests/ run by default (and in CI). The local-only
+# integration tests under local_tests/ need a live LLM server and are invoked
+# explicitly, e.g.: uv run pytest local_tests/test_local_ollama.py -s
+testpaths = ["tests"]

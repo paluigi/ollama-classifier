@@ -40,9 +40,15 @@ Backend wrapping the Ollama runtime (≥v0.12) via the official Python SDK.
 Constraint mechanism: **JSON Schema enum** via the ``format`` parameter. The
 model generates ``{"label": "<chosen_label>"}``; structural JSON tokens
 (``{``, ``"label"``, ``:``, ``"``, ``}``) are filtered during trie
-reconstruction. ``tokenize()`` uses context-dependent tokenization so the
-label is tokenized within the JSON prefix it appears in, ensuring the trie
-matches the actual response tokens.
+reconstruction and completion scoring.
+
+Modern Ollama runtimes removed the ``/api/tokenize`` endpoint and do not
+support fill-in-the-middle ("insert") on instruct models. ``OllamaBackend``
+therefore obtains both label tokenization and completion scores through
+**empirical forced constrained generation**: it forces a label as the only
+valid choice in a ``chat()`` call and reads back the model's genuine
+per-token logprobs. Tokenization results are memoized per label to amortize
+the cost.
 
 Because Ollama wraps labels in JSON, its
 :attr:`~ollama_classifier.backends.base.LLMBackend.supports_bare_label_constraint`
@@ -197,10 +203,12 @@ property that tells the classifier how to tokenize labels for trie
 construction:
 
 - **``True``** (vLLM, SGLang, llama.cpp): ``chat()`` generates bare label
-  text with no wrapper. Labels are tokenized standalone (``context=None``).
+  text with no wrapper. Labels are tokenized standalone via the engine's
+  ``/tokenize`` endpoint.
 - **``False``** (Ollama): ``chat()`` wraps labels in JSON. Labels are
-  tokenized within the JSON prefix (``context='{"label": "'``) so the trie
-  matches the actual response tokens.
+  tokenized through forced constrained generation (forcing the label as the
+  only valid choice) so the resulting tokens match the actual response
+  tokens exactly.
 
 This is handled automatically by ``LLMClassifier`` — you do not need to
 inspect it directly.

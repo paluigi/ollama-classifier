@@ -5,8 +5,15 @@ Wraps the Ollama Python SDK behind the :class:`LLMBackend` interface.
 Constraint mechanism: JSON Schema enum via the ``format`` parameter.
 The model generates JSON: ``{"label": "<chosen_label>"}``. Structural JSON
 tokens (``{``, ``"label"``, ``:``, ``"``, ``}``) are filtered during trie
-reconstruction. Context-dependent tokenization is used so the trie matches
-the actual response tokens.
+reconstruction and completion scoring.
+
+Note:
+    Modern Ollama removed the ``/api/tokenize`` endpoint and does not support
+    fill-in-the-middle ("insert") on instruct models. This backend therefore
+    obtains exact label tokenization and completion scores through empirical
+    *forced constrained generation* (forcing a label as the only valid choice
+    and reading back the model's genuine per-token logprobs). No ``/api/tokenize``
+    or ``suffix``/insert calls are used.
 
 Local usage::
 
@@ -34,9 +41,11 @@ class OllamaBackend(LLMBackend):
 
     Note:
         Ollama's constraint mechanism is JSON Schema enum, which wraps the label
-        in JSON structural tokens. The :meth:`tokenize` method supports
-        context-dependent tokenization so the label is tokenized within the
-        JSON prefix it appears in, ensuring the trie matches the response tokens.
+        in JSON structural tokens. Tokenization and completion scoring are both
+        obtained through empirical forced constrained generation (modern Ollama
+        has no ``/api/tokenize`` and instruct models reject insert/fill-mode),
+        so the label tokens used for trie reconstruction match the response
+        tokens exactly.
     """
 
     # JSON prefix that precedes the label text in the response
@@ -73,6 +82,9 @@ class OllamaBackend(LLMBackend):
         )
         self._sync_client = sync_client
         self._async_client = async_client
+        # Empirical tokenization is deterministic per label (the JSON wrapper
+        # prefix is constant), so memoize per label to amortize the setup cost.
+        self._token_cache: dict[str, list[Token]] = {}
 
     @property
     def supports_bare_label_constraint(self) -> bool:
@@ -153,6 +165,52 @@ class OllamaBackend(LLMBackend):
         except (json.JSONDecodeError, TypeError):
             return content
 
+    @staticmethod
+    def _label_token_logprobs(
+        logprobs: List[TokenLogprob], label: str
+    ) -> List[TokenLogprob]:
+        """Extract the label-value tokens (with their logprobs) from a
+        ``{"label": "<label>"}`` constrained response.
+
+        Robust to model-specific whitespace in the emitted JSON. The returned
+        tokens keep their *exact* emitted strings so they match the tokens the
+        model produces during multi-label constrained generation in
+        :meth:`LLMClassifier.generate`.
+
+        Primary strategy: reconstruct the full emitted string, locate the value
+        span after the JSON ``:`` separator, and map that character span back to
+        token indices. Falls back to JSON-skeleton filtering if the span mapping
+        yields nothing.
+        """
+        full = "".join(lp.token for lp in logprobs)
+
+        # ---- Primary: character-offset span mapping ----
+        try:
+            colon = full.index(":")
+            vstart = full.index(label, colon + 1)
+            vend = vstart + len(label)
+            out: list[TokenLogprob] = []
+            pos = 0
+            for lp in logprobs:
+                tok_end = pos + len(lp.token)
+                if tok_end > vstart and pos < vend:
+                    out.append(lp)
+                pos = tok_end
+            if out:
+                return out
+        except ValueError:
+            pass
+
+        # ---- Fallback: drop pure JSON-structure tokens / the "label" key ----
+        out = []
+        for lp in logprobs:
+            stripped = lp.token.strip()
+            cleaned = stripped.strip('"{}: \t\n')
+            if cleaned == "" or stripped == "label":
+                continue
+            out.append(lp)
+        return out
+
     # ------------------------------------------------------------------
     # Sync interface
     # ------------------------------------------------------------------
@@ -196,33 +254,31 @@ class OllamaBackend(LLMBackend):
         messages: List[ChatMessage],
         completion: str,
     ) -> ScoringResponse:
-        """Score a completion using Ollama's generate endpoint with suffix.
+        """Score a completion by forcing it as the single valid label.
 
-        Uses ``client.generate(prompt=..., suffix=completion)`` to compute
-        the per-token logprobs of the completion given the prompt context.
-        No generation occurs (``num_predict=0``).
+        Modern Ollama (and instruct models in general) do not support the
+        fill-in-the-middle ("insert") mode that ``/api/generate`` with
+        ``suffix=`` requires. Instead, this forces ``completion`` as the only
+        valid label via a JSON-enum constrained :meth:`chat` call and reads back
+        the model's genuine per-token logprobs (teacher forcing). No free
+        generation occurs beyond the forced label.
         """
-        client = self._get_sync_client()
-        prompt = "\n\n".join(
-            m.content for m in messages if m.role in ("system", "user")
-        )
-
-        response = client.generate(
-            model=self._model,
-            prompt=prompt,
-            suffix=completion,
+        response = self.chat(
+            messages=messages,
+            temperature=0.0,
+            constrain_labels=[completion],
             logprobs=True,
-            options={
-                "temperature": 0.0,
-                "num_predict": 0,
-                **self._extra_body,
-            },
+            top_logprobs=1,
         )
-
+        lps = self._label_token_logprobs(response.logprobs or [], completion)
+        if not lps:
+            raise RuntimeError(
+                f"score({completion!r}): forced generation returned no value tokens"
+            )
         return ScoringResponse(
             completion=completion,
-            logprobs=self._parse_logprobs(response) or [],
-            raw=response.model_dump() if hasattr(response, "model_dump") else {},
+            logprobs=lps,
+            raw=response.raw,
         )
 
     def tokenize(
@@ -231,24 +287,34 @@ class OllamaBackend(LLMBackend):
         *,
         context: Optional[str] = None,
     ) -> List[Token]:
-        """Tokenize text using Ollama's tokenize API.
+        """Tokenize text via empirical forced generation.
 
-        If ``context`` is provided, tokenizes ``context + text`` and returns
-        only the tokens corresponding to ``text``. This ensures
-        context-dependent tokenization matches the actual response tokens
-        (critical for JSON-wrapped labels).
+        Modern Ollama removed the ``/api/tokenize`` endpoint (and the SDK no
+        longer exposes a ``tokenize`` method). To get the *exact* token strings
+        the model emits for ``text`` inside the JSON wrapper, this forces
+        ``text`` as the only valid label in a constrained :meth:`chat` call and
+        reads back the emitted value tokens. Results are memoized per label.
+
+        The ``context`` argument is accepted for interface compatibility but
+        ignored: Ollama always wraps the label in the constant JSON prefix
+        ``'{"label": "'`` regardless of surrounding prompt tokens.
         """
-        client = self._get_sync_client()
-        full_text = (context or "") + text
-        response = client.tokenize(model=self._model, text=full_text)
-        tokens: list[int] = response.get("tokens", [])
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached
 
-        if context:
-            ctx_response = client.tokenize(model=self._model, text=context)
-            ctx_len = len(ctx_response.get("tokens", []))
-            tokens = tokens[ctx_len:]
-
-        return [Token(text="", id=t) for t in tokens]
+        response = self.chat(
+            messages=[ChatMessage(role="user", content=text)],
+            temperature=0.0,
+            constrain_labels=[text],
+            logprobs=True,
+            top_logprobs=1,
+        )
+        lps = self._label_token_logprobs(response.logprobs or [], text)
+        tokens = [Token(text=lp.token, id=-1) for lp in lps]
+        tokens = tokens or [Token(text=text, id=-1)]
+        self._token_cache[text] = tokens
+        return tokens
 
     # ------------------------------------------------------------------
     # Async interface
@@ -293,28 +359,26 @@ class OllamaBackend(LLMBackend):
         messages: List[ChatMessage],
         completion: str,
     ) -> ScoringResponse:
-        """Async completion scoring via Ollama."""
-        client = await self._get_async_client()
-        prompt = "\n\n".join(
-            m.content for m in messages if m.role in ("system", "user")
-        )
+        """Async completion scoring via forced constrained generation.
 
-        response = await client.generate(
-            model=self._model,
-            prompt=prompt,
-            suffix=completion,
+        See :meth:`score` for the rationale (no insert/fill-in-the-middle).
+        """
+        response = await self.achat(
+            messages=messages,
+            temperature=0.0,
+            constrain_labels=[completion],
             logprobs=True,
-            options={
-                "temperature": 0.0,
-                "num_predict": 0,
-                **self._extra_body,
-            },
+            top_logprobs=1,
         )
-
+        lps = self._label_token_logprobs(response.logprobs or [], completion)
+        if not lps:
+            raise RuntimeError(
+                f"ascore({completion!r}): forced generation returned no value tokens"
+            )
         return ScoringResponse(
             completion=completion,
-            logprobs=self._parse_logprobs(response) or [],
-            raw=response.model_dump() if hasattr(response, "model_dump") else {},
+            logprobs=lps,
+            raw=response.raw,
         )
 
     async def atokenize(
@@ -323,15 +387,24 @@ class OllamaBackend(LLMBackend):
         *,
         context: Optional[str] = None,
     ) -> List[Token]:
-        """Async tokenization via Ollama."""
-        client = await self._get_async_client()
-        full_text = (context or "") + text
-        response = await client.tokenize(model=self._model, text=full_text)
-        tokens: list[int] = response.get("tokens", [])
+        """Async empirical tokenization via forced constrained generation.
 
-        if context:
-            ctx_response = await client.tokenize(model=self._model, text=context)
-            ctx_len = len(ctx_response.get("tokens", []))
-            tokens = tokens[ctx_len:]
+        See :meth:`tokenize` for the rationale. Reuses the sync memoization
+        cache since tokenization is deterministic.
+        """
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached
 
-        return [Token(text="", id=t) for t in tokens]
+        response = await self.achat(
+            messages=[ChatMessage(role="user", content=text)],
+            temperature=0.0,
+            constrain_labels=[text],
+            logprobs=True,
+            top_logprobs=1,
+        )
+        lps = self._label_token_logprobs(response.logprobs or [], text)
+        tokens = [Token(text=lp.token, id=-1) for lp in lps]
+        tokens = tokens or [Token(text=text, id=-1)]
+        self._token_cache[text] = tokens
+        return tokens
