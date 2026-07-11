@@ -9,7 +9,7 @@ Each backend translates the high-level ``constrain_labels`` parameter to its
 native constraint mechanism:
 
 - **Ollama**: JSON Schema enum via ``format``
-- **vLLM**: ``guided_choice``
+- **vLLM**: ``structured_outputs.choice``
 - **SGLang**: ``regex``
 - **llama.cpp**: GBNF ``grammar``
 """

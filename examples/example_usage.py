@@ -1,6 +1,6 @@
 """Example usage of ollama-classifier with multiple backends.
 
-This script demonstrates the v0.4.1 unified architecture:
+This script demonstrates the v0.5.0 unified architecture:
 
 - All backends are used the same way: create a backend, wrap it in
   ``LLMClassifier``, and call ``generate()`` or ``classify()``.
@@ -310,7 +310,7 @@ def llamacpp_example() -> None:
 def main() -> None:
     """Run all examples."""
     print("=" * 60)
-    print("OLLAMA CLASSIFIER — EXAMPLE USAGE (v0.4.1)")
+    print("OLLAMA CLASSIFIER — EXAMPLE USAGE (v0.5.0)")
     print("=" * 60)
 
     # Sync examples (Ollama backend)

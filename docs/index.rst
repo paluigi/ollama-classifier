@@ -22,7 +22,7 @@ Features
 --------
 
 - **Two Scoring Methods**: ``generate()`` for adaptive budget-controlled scoring, ``classify()`` for exact gold-standard confidence
-- **Constrained Output**: Output is guaranteed to be one of your labels (JSON enum, ``guided_choice``, regex, or GBNF — depending on backend)
+- **Constrained Output**: Output is guaranteed to be one of your labels (JSON enum, ``structured_outputs.choice``, regex, or GBNF — depending on backend)
 - **Calibrated Confidence**: Probability distribution over all choices with geometric-mean normalization (no token-count bias)
 - **Sync & Async**: Full support for both synchronous and asynchronous operations
 - **Batch Processing**: Classify multiple texts efficiently with parallel execution

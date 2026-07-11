@@ -73,17 +73,25 @@ vLLM
 High-throughput serving engine for LLMs. Supports guided decoding and
 logprobs out of the box.
 
-Constraint mechanism: **``guided_choice``** — constrains the model to generate
-exactly one of the provided label strings, as **bare label text** (no JSON
-wrapper). Logprobs are pre-mask (raw model logits before guided-decoding
-masking). ``supports_bare_label_constraint`` is ``True``.
+Constraint mechanism: **``structured_outputs.choice``** (vLLM v0.12.0+) —
+replaces the deprecated ``guided_choice``; constrains the model to generate
+exactly one of the provided label strings as **bare label text** (no JSON
+wrapper). Logprobs are pre-mask (raw model logits before constraint masking).
+``supports_bare_label_constraint`` is ``True``.
+
+**Scoring:** ``score()`` uses ``/v1/completions`` with ``echo=True`` (prefill,
+no constraint, no generation) to recover genuine per-label logprobs. The
+``/tokenize`` endpoint pinpoints the label-token boundary.
+
+**Tokenization:** ``tokenize()`` uses forced constrained generation via
+``structured_outputs.choice`` so token boundaries match the actual
+constrained-generation output. Results are memoized per label.
 
 **Local server:**
 
 .. code-block:: bash
 
-   python -m vllm.entrypoints.openai.api_server \
-       --model meta-llama/Llama-3.2-3B-Instruct \
+   vllm serve Qwen/Qwen2.5-3B-Instruct \
        --host 0.0.0.0 --port 8000
 
 **Connect:**
@@ -93,7 +101,7 @@ masking). ``supports_bare_label_constraint`` is ``True``.
    from ollama_classifier.backends import VLLMBackend
 
    backend = VLLMBackend(
-       model="meta-llama/Llama-3.2-3B-Instruct",
+       model="Qwen/Qwen2.5-3B-Instruct",
        base_url="http://localhost:8000/v1",
    )
 
@@ -116,6 +124,15 @@ Constraint mechanism: **regex** — builds a regex from the escaped labels
 (``("label1|label2|...")``) so the model generates **bare label text** with no
 JSON wrapper. Logprobs are pre-mask (raw model logits before regex masking).
 ``supports_bare_label_constraint`` is ``True``.
+
+**Scoring:** ``score()`` uses ``/v1/completions`` with ``echo=True`` (prefill,
+no constraint) to recover genuine per-label logprobs. The ``/tokenize``
+endpoint (with the correct ``"prompt"`` field) pinpoints the label-token
+boundary.
+
+**Tokenization:** ``tokenize()`` uses forced constrained generation via regex
+so token boundaries match the actual constrained-generation output. Results
+are memoized per label.
 
 **Local server:**
 
@@ -149,8 +166,14 @@ exactly one of the provided labels::
 
 This generates **bare label text** with no JSON wrapper, so logprob
 reconstruction is clean. ``llama-server`` accepts a non-standard ``grammar``
-field on the ``/v1/chat/completions`` endpoint (``response_format`` with JSON
-schema is buggy in llama.cpp). ``supports_bare_label_constraint`` is ``True``.
+field on the ``/v1/chat/completions`` endpoint. ``supports_bare_label_constraint``
+is ``True``.
+
+**Scoring & tokenization:** Both ``score()`` and ``tokenize()`` use forced
+constrained generation via GBNF grammar because llama.cpp does **not** support
+``echo=True`` on the completions endpoint (it only returns generated-token
+logprobs, not prompt tokens), so the echo/prefill approach used by vLLM and
+SGLang is unavailable. Results are memoized per label.
 
 **Local server:**
 
@@ -187,7 +210,8 @@ native constraint mechanism:
 | ``OllamaBackend``    | JSON Schema enum       | ``{"label": "..."}``     | ``False``                   |
 |                      | (``format``)           |                          |                             |
 +----------------------+------------------------+--------------------------+-----------------------------+
-| ``VLLMBackend``      | ``guided_choice``      | bare label text          | ``True``                    |
+| ``VLLMBackend``      | ``structured_outputs.  | bare label text          | ``True``                    |
+|                      | ``choice``             |                          |                             |
 +----------------------+------------------------+--------------------------+-----------------------------+
 | ``SGLangBackend``    | ``regex``              | bare label text          | ``True``                    |
 +----------------------+------------------------+--------------------------+-----------------------------+
@@ -203,8 +227,11 @@ property that tells the classifier how to tokenize labels for trie
 construction:
 
 - **``True``** (vLLM, SGLang, llama.cpp): ``chat()`` generates bare label
-  text with no wrapper. Labels are tokenized standalone via the engine's
-  ``/tokenize`` endpoint.
+  text with no wrapper. Labels are tokenized via **empirical forced constrained
+  generation** (forcing the label as the only valid choice) so token boundaries
+  match actual constrained-generation output. vLLM and SGLang additionally
+  use the ``/tokenize`` endpoint to count tokens for the echo/prefill boundary
+  in ``score()``.
 - **``False``** (Ollama): ``chat()`` wraps labels in JSON. Labels are
   tokenized through forced constrained generation (forcing the label as the
   only valid choice) so the resulting tokens match the actual response

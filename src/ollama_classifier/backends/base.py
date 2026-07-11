@@ -3,7 +3,7 @@
 All backends communicate via HTTP using the OpenAI-compatible chat completions
 API (which vLLM, SGLang, and llama.cpp server all support). Each backend
 translates the high-level ``constrain_labels`` parameter to its native
-constraint mechanism (``guided_choice``, ``regex``, JSON enum, or GBNF grammar).
+constraint mechanism (``structured_outputs.choice``, ``regex``, JSON enum, or GBNF grammar).
 """
 
 from abc import ABC, abstractmethod
@@ -133,7 +133,7 @@ class LLMBackend(ABC):
         """Perform a synchronous constrained chat completion.
 
         Each backend translates ``constrain_labels`` to its native constraint
-        mechanism (``guided_choice``, ``regex``, JSON enum, or GBNF grammar).
+        mechanism (``structured_outputs.choice``, ``regex``, JSON enum, or GBNF grammar).
 
         Args:
             messages: List of chat messages.
@@ -266,7 +266,7 @@ class LLMBackend(ABC):
     def _apply_constraint(self, body: Dict[str, Any], labels: List[str]) -> None:
         """Apply backend-specific output constraint.
 
-        Override in subclasses to add ``guided_choice``, ``regex``,
+        Override in subclasses to add ``structured_outputs.choice``, ``regex``,
         ``format`` (JSON enum), or ``grammar`` (GBNF) to the request body.
         """
         raise NotImplementedError(

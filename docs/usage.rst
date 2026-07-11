@@ -77,7 +77,7 @@ probability distribution.
 |                   | ``generate()``                                      | ``classify()``                                              |
 +===================+=====================================================+=============================================================+
 | How it works      | Adaptive constrained generation over a prefix trie  | Multi-call completion scoring: each label scored as a       |
-|                   | of label tokens; per-label logprobs reconstructed   | completion of the prompt without generation.                |
+|                   | of label tokens; per-label logprobs reconstructed   | completion of the prompt (echo/prefill or forced generation).                |
 |                   | from the winning path and unresolved clusters.      |                                                             |
 +-------------------+-----------------------------------------------------+-------------------------------------------------------------+
 | API calls         | 1 to ``max_calls`` (adaptive)                       | N calls for N labels                                        |
@@ -140,7 +140,8 @@ Multi-Call Scoring (``classify``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Makes one completion-scoring call per label. Each label's per-token logprobs
-are extracted *without generation*, then normalized via geometric mean to
+are extracted via echo/prefill (vLLM, SGLang) or forced constrained
+generation (Ollama, llama.cpp), then normalized via geometric mean to
 eliminate token-count bias. This is the gold-standard confidence method.
 
 .. code-block:: python

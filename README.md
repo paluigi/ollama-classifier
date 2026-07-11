@@ -7,7 +7,7 @@ Every backend works through a single unified `LLMClassifier` with two scoring me
 ## Features
 
 - **Two Scoring Methods**: `generate()` for adaptive budget-controlled scoring, `classify()` for exact gold-standard confidence
-- **Constrained Output**: Output is guaranteed to be one of your labels (JSON enum, `guided_choice`, regex, or GBNF — depending on backend)
+- **Constrained Output**: Output is guaranteed to be one of your labels (JSON enum, `structured_outputs.choice`, regex, or GBNF — depending on backend)
 - **Calibrated Confidence**: Probability distribution over all choices with geometric-mean normalization (no token-count bias)
 - **Sync & Async**: Full support for both synchronous and asynchronous operations
 - **Batch Processing**: Classify multiple texts efficiently with parallel execution
@@ -156,7 +156,7 @@ result = classifier.generate(text="...", choices=[...], max_calls=None)
 
 ### `classify()` — exact, N calls
 
-Makes one completion-scoring call per label. Each label's per-token logprobs are extracted *without generation*, then normalized via geometric mean to eliminate token-count bias. This is the gold-standard confidence method.
+Makes one completion-scoring call per label. Each label's per-token logprobs are extracted via echo/prefill (vLLM, SGLang) or forced constrained generation (Ollama, llama.cpp), then normalized via geometric mean to eliminate token-count bias. This is the gold-standard confidence method.
 
 ```python
 result = classifier.classify(
@@ -293,7 +293,7 @@ classifier = LLMClassifier(backend)
 
 ### vLLM
 
-High-throughput serving engine. Constraint mechanism: **`guided_choice`** (generates bare label text).
+High-throughput serving engine. Constraint mechanism: **`structured_outputs.choice`** (vLLM v0.12.0+, replaces deprecated `guided_choice`; generates bare label text). `score()` uses echo/prefill; `tokenize()` uses forced constrained generation.
 
 **Local server:**
 ```bash
@@ -323,7 +323,7 @@ backend = VLLMBackend(
 
 ### SGLang
 
-Fast serving system for large language models. Constraint mechanism: **regex** (generates bare label text).
+Fast serving system for large language models. Constraint mechanism: **regex** (generates bare label text). `score()` uses echo/prefill; `tokenize()` uses forced constrained generation.
 
 **Local server:**
 ```bash
@@ -344,7 +344,7 @@ backend = SGLangBackend(
 
 ### llama.cpp
 
-Lightweight inference via `llama-server`. Ideal for CPU or mixed CPU/GPU environments. Constraint mechanism: **GBNF grammar** (generates bare label text).
+Lightweight inference via `llama-server`. Ideal for CPU or mixed CPU/GPU environments. Constraint mechanism: **GBNF grammar** (generates bare label text). `score()` and `tokenize()` use forced constrained generation (echo not supported by llama.cpp).
 
 **Local server:**
 ```bash

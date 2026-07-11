@@ -6,64 +6,79 @@ All notable changes to this project will be documented in this file.
 The format is based on `Keep a Changelog <https://keepachangelog.com/en/1.0.0/>`_,
 and this project adheres to `Semantic Versioning <https://semver.org/spec/v2.0.0.html>`_.
 
-[0.5.0] - 2026-07-07
+[0.5.0] - 2026-07-11
 --------------------
 
-**Behavior change:** ``score()`` now performs constrained generation (teacher
-forcing) instead of a no-generation forward pass. This is a minor version bump
-because the ``score()`` / ``classify()`` contract and per-call cost change.
-
-Both ``OllamaBackend`` and ``SGLangBackend`` were rewritten to use empirical
-**forced constrained generation** for tokenization and completion scoring. This
-fixes compatibility with modern Ollama (removed ``/api/tokenize``, no insert
-support) and SGLang (tokenization mismatch between standalone BPE and
-constrained generation).
+**Behavior change:** All four backends were rewritten with a unified
+architecture: ``tokenize()`` uses empirical forced constrained generation
+across all backends, and ``score()`` uses echo/prefill (vLLM, SGLang) or
+forced constrained generation (Ollama, llama.cpp) depending on server
+capabilities. This is a minor version bump because the ``score()`` /
+``classify()`` contract and per-call cost change.
 
 Fixed
 ~~~~~
 
 - ``OllamaBackend.tokenize()`` no longer calls the removed ``client.tokenize``
-  (``AttributeError``). ``SGLangBackend.tokenize()`` no longer sends the wrong
-  field name (``"text"`` vs the API's ``"prompt"``). Both now use forced
-  constrained generation. Results are memoized per label.
+  (``AttributeError``). All backends' ``tokenize()`` now use forced constrained
+  generation so token boundaries match actual constrained-generation output.
+  Results are memoized per label.
 - ``OllamaBackend.score()`` no longer uses ``client.generate(suffix=...)``
-  (``does not support insert`` HTTP 400 on instruct models).
-  ``SGLangBackend.score()`` no longer relies on the broken ``/tokenize``
-  endpoint and spurious-token ``echo`` approach. Both now force the candidate
-  label as the single valid choice via ``chat()`` and extract the model's
-  genuine per-token logprobs.
-- Async variants (``atokenize()``, ``ascore()``) updated to match for both
-  backends.
-- ``score()`` / ``ascore()`` now raise ``RuntimeError`` when forced generation
-  yields no value tokens (previously returned empty logprobs silently, which
-  ``classify()`` treated as ``-inf``).
+  (``does not support insert`` HTTP 400 on instruct models). Now uses forced
+  constrained generation via JSON Schema enum.
+- ``SGLangBackend.score()`` rewritten to use echo/prefill (``/v1/completions``
+  with ``echo=True``) with the correct ``"prompt"`` field in ``/tokenize`` for
+  boundary detection. Produces differentiated confidence for ``classify()``
+  (was near-uniform with forced generation due to prompt-priming).
+- ``SGLangBackend.tokenize()`` no longer sends the wrong field name (``"text"``
+  vs the API's ``"prompt"``). Now uses forced constrained generation via regex.
+- ``VLLMBackend`` constraint updated from deprecated ``guided_choice`` (removed
+  in vLLM v0.12.0) to ``structured_outputs.choice``. ``score()`` rewritten to
+  use echo/prefill; ``tokenize()`` uses forced constrained generation.
+- ``LlamaCppBackend.score()`` rewritten from broken ``suffix``-based completions
+  to forced GBNF grammar generation (llama.cpp does not support ``echo=True``
+  on the completions endpoint).
+- All backends: ``score()`` / ``ascore()`` now raise ``RuntimeError`` when no
+  value tokens are returned (previously returned empty logprobs silently).
+- All backends: HTTP client pooling added (reusable ``httpx.Client`` /
+  ``AsyncClient``) to avoid per-call connection setup.
+- ``VLLMBackend.supports_bare_label_constraint`` changed from ``False`` to
+  ``True`` (``structured_outputs.choice`` generates bare label text).
 
 Changed
 ~~~~~~~
 
 - **Behavior change:** ``LLMBackend.score()`` base contract updated —
-  ``score()`` now performs teacher-forced constrained generation, not a
-  no-generation forward pass. Per-call cost increases (one full generation per
-  label instead of a prefill).
+  ``score()`` now uses echo/prefill (vLLM, SGLang) or forced constrained
+  generation (Ollama, llama.cpp), not a no-generation forward pass.
 - ``Token.id`` from ``tokenize()`` is now always ``-1`` (empirical tokens have
   no stable server-side ID). Downstream consumers should not rely on
-  ``Token.id`` for Ollama/SGLang backends.
-- ``OllamaBackend`` and ``SGLangBackend`` module/class docstrings updated to
-  document the forced-generation mechanism.
-- ``SGLangBackend._render_prompt()``, ``_tokenize_count()``, and
-  ``_atokenize_count()`` removed (only used by the old ``score()``).
+  ``Token.id``.
+- All backend module/class docstrings updated to document the scoring and
+  tokenization mechanisms.
+- ``LlamaCppBackend._render_prompt()``, ``_find_completion_start()``, and
+  ``_tokenize_ids()`` removed (only used by the old ``score()``).
 
 Added
 ~~~~~
 
 - ``OllamaBackend._label_token_logprobs()`` — extracts label-value tokens from
   a ``{"label": "..."}`` response via char-offset span mapping.
-- ``SGLangBackend._label_token_logprobs()`` — filters special/EOS tokens from
-  bare-label responses. Expanded ``_SPECIAL_TOKENS`` set covers Llama-3, Phi,
-  and Qwen EOS markers.
+- ``SGLangBackend._label_token_logprobs()`` and ``VLLMBackend._label_token_logprobs()``
+  — filter special/EOS tokens from bare-label responses.
+  ``_SPECIAL_TOKENS`` frozenset covers Llama-3, Phi, and Qwen EOS markers.
+- ``LlamaCppBackend._label_token_logprobs()`` — same special-token filter.
+- ``SGLangBackend._render_prompt()``, ``_tokenize_count()``, ``_atokenize_count()``
+  — reintroduced for the echo/prefill ``score()``.
+- ``VLLMBackend._render_prompt()``, ``_tokenize_count()``, ``_atokenize_count()``
+  — same echo/prefill helpers.
 - ``tests/test_ollama_backend.py`` — unit tests for the Ollama helper (no
   server required).
+- ``local_tests/`` — integration test infrastructure with dataset evaluation
+  and CSV output for all four backends (Ollama, SGLang, vLLM, llama.cpp).
 
+[0.4.1] - 2026-07-06
+--------------------
 [0.4.1] - 2026-07-06
 --------------------
 
