@@ -7,9 +7,19 @@ label alternatives directly::
 
     root ::= "positive" | "negative" | "neutral"
 
-This generates **bare label text** — no JSON wrapper — so logprob
+This generates **bare label text** -- no JSON wrapper -- so logprob
 reconstruction is clean. ``llama-server`` accepts a non-standard ``grammar``
 field on the ``/v1/chat/completions`` endpoint.
+
+**Scoring approach:** ``score()`` uses forced constrained generation via GBNF
+grammar -- forcing each label individually and reading back the model's genuine
+per-token logprobs (pre-mask). llama.cpp does NOT support ``echo=True`` on the
+completions endpoint (it only returns generated-token logprobs, not prompt
+tokens), so the echo/prefill approach used by SGLang/vLLM is not available.
+
+**Tokenization approach:** ``tokenize()`` uses the same forced constrained
+generation to obtain empirical token strings that match the actual
+constrained-generation token boundaries.
 
 Local server::
 
@@ -31,16 +41,26 @@ class LlamaCppBackend(LLMBackend):
     """Backend for llama.cpp server (``llama-server``).
 
     llama.cpp provides a lightweight inference server with an OpenAI-compatible
-    API. GBNF grammar constraints and logprobs are supported when compiled
-    with the appropriate flags. Logprobs are pre-mask (model's raw distribution
-    before grammar masking).
+    API. GBNF grammar constraints and logprobs are supported. Logprobs are
+    pre-mask (model's raw distribution before grammar masking).
 
-    Note:
-        ``response_format`` with JSON schema on ``/v1/chat/completions`` is buggy
-        in llama.cpp (GitHub issues #11988, #11847). This backend uses the
-        non-standard ``grammar`` field with GBNF instead, which works reliably
-        for bare label generation.
+    Both ``score()`` and ``tokenize()`` use forced constrained generation via
+    GBNF grammar because llama.cpp's ``echo`` only returns generated-token
+    logprobs (not prompt tokens), making the echo/prefill approach unusable.
     """
+
+    # End-of-sequence / special tokens to filter from constrained responses
+    _SPECIAL_TOKENS = frozenset(
+        {
+            "<|im_end|>",
+            "<|endoftext|>",
+            "</s>",
+            "<|end_of_turn|>",
+            "<|eot_id|>",
+            "<|end|>",
+            "<|eom_id|>",
+        }
+    )
 
     def __init__(
         self,
@@ -60,11 +80,26 @@ class LlamaCppBackend(LLMBackend):
             max_tokens=max_tokens,
             extra_body=extra_body,
         )
+        self._token_cache: dict[str, list[Token]] = {}
+        self._sync_http: httpx.Client | None = None
+        self._async_http: httpx.AsyncClient | None = None
 
     @property
     def supports_bare_label_constraint(self) -> bool:
-        """True — GBNF grammar generates bare label text."""
+        """True -- GBNF grammar generates bare label text."""
         return True
+
+    def _get_sync_http(self) -> httpx.Client:
+        """Return a pooled sync HTTP client (created lazily)."""
+        if self._sync_http is None:
+            self._sync_http = httpx.Client(timeout=self._timeout)
+        return self._sync_http
+
+    async def _get_async_http(self) -> httpx.AsyncClient:
+        """Return a pooled async HTTP client (created lazily)."""
+        if self._async_http is None:
+            self._async_http = httpx.AsyncClient(timeout=self._timeout)
+        return self._async_http
 
     def _apply_constraint(self, body: Dict[str, Any], labels: List[str]) -> None:
         """Apply GBNF grammar constraint for bare-label generation.
@@ -73,19 +108,25 @@ class LlamaCppBackend(LLMBackend):
 
             root ::= "label1" | "label2" | "label3"
         """
-        # Escape quotes in labels for GBNF
-        quoted = [f'"{l}"' for l in labels]
+        quoted = [f'"{lbl}"' for lbl in labels]
         body["grammar"] = f"root ::= {' | '.join(quoted)}"
 
-    def _render_prompt(self, messages: List[ChatMessage]) -> str:
-        """Render messages to a plain text prompt for the completions endpoint."""
-        parts: list[str] = []
-        for m in messages:
-            if m.role == "system":
-                parts.append(f"<|system|>\n{m.content}")
-            elif m.role == "user":
-                parts.append(f"<|user|>\n{m.content}")
-        return "\n\n".join(parts) + "\n\n<|assistant|>\n"
+    @staticmethod
+    def _label_token_logprobs(
+        logprobs: List[TokenLogprob],
+    ) -> List[TokenLogprob]:
+        """Extract label tokens from a bare-label constrained response.
+
+        For llama.cpp (bare-label backend), this filters out special /
+        end-of-sequence tokens and empty strings. The GBNF grammar constraint
+        guarantees only the label text is generated, so no JSON-structure
+        filtering is needed.
+        """
+        return [
+            lp
+            for lp in logprobs
+            if lp.token.strip() and lp.token not in LlamaCppBackend._SPECIAL_TOKENS
+        ]
 
     # ------------------------------------------------------------------
     # Sync
@@ -109,82 +150,44 @@ class LlamaCppBackend(LLMBackend):
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
-        with httpx.Client(timeout=self._timeout) as client:
-            resp = client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            result = self._parse_chat_response(resp.json())
-            result.label = result.content.strip()
-            return result
+        resp = self._get_sync_http().post(url, headers=self._build_headers(), json=body)
+        resp.raise_for_status()
+        result = self._parse_chat_response(resp.json())
+        result.label = result.content.strip()
+        return result
 
     def score(
         self,
         messages: List[ChatMessage],
         completion: str,
     ) -> ScoringResponse:
-        """Score a completion using llama.cpp's completions endpoint with suffix.
+        """Score a completion by forcing it as the single valid label.
 
-        Uses ``/v1/completions`` with ``suffix`` to compute the per-token
-        logprobs of the completion given the prompt context (fill-in-the-middle
-        style scoring).
+        Forces ``completion`` as the only valid choice via a GBNF grammar
+        constraint and reads back the model's genuine per-token logprobs
+        (teacher forcing, pre-mask).
+
+        llama.cpp does not support ``echo=True`` on the completions endpoint
+        (it only returns generated-token logprobs, not prompt tokens), so the
+        echo/prefill approach used by SGLang/vLLM is not available here.
         """
-        prompt = self._render_prompt(messages)
-        url = f"{self._base_url}/completions"
-        body: Dict[str, Any] = {
-            "model": self._model,
-            "prompt": prompt,
-            "suffix": completion,
-            "max_tokens": 0,
-            "temperature": 0.0,
-            "logprobs": 1,
-            "echo": True,
-            **self._extra_body,
-        }
-        with httpx.Client(timeout=self._timeout) as client:
-            resp = client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            data = resp.json()
-
-        choice = data["choices"][0]
-        all_logprobs = choice.get("logprobs", {})
-        tokens_list = all_logprobs.get("tokens", [])
-        token_lps_list = all_logprobs.get("token_logprobs", [])
-        top_lps_list = all_logprobs.get("top_logprobs", [])
-
-        # Find where the completion starts in the token list
-        # With suffix + echo, llama.cpp returns prompt tokens followed by completion tokens
-        # The completion tokens are at the end
-        # We identify them by matching the completion text
-        completion_start = self._find_completion_start(tokens_list, completion)
-
-        token_logprobs: list[TokenLogprob] = []
-        for i in range(completion_start, len(tokens_list)):
-            top: dict[str, float] = {}
-            if i < len(top_lps_list) and top_lps_list[i]:
-                for t, lp in top_lps_list[i].items():
-                    top[t] = lp
-            lp = token_lps_list[i] if i < len(token_lps_list) else 0.0
-            token_logprobs.append(
-                TokenLogprob(token=tokens_list[i], logprob=lp or 0.0, top_logprobs=top)
+        response = self.chat(
+            messages=messages,
+            temperature=0.0,
+            constrain_labels=[completion],
+            logprobs=True,
+            top_logprobs=1,
+        )
+        lps = self._label_token_logprobs(response.logprobs or [])
+        if not lps:
+            raise RuntimeError(
+                f"score({completion!r}): forced generation returned no value tokens"
             )
-
-        return ScoringResponse(completion=completion, logprobs=token_logprobs, raw=data)
-
-    @staticmethod
-    def _find_completion_start(tokens: list[str], completion: str) -> int:
-        """Heuristically find where the completion tokens begin.
-
-        With suffix + echo, llama.cpp returns [prompt_tokens, completion_tokens].
-        We search for the suffix position by accumulating token text until it
-        matches the start of the completion string.
-        """
-        if not tokens:
-            return 0
-        accumulated = ""
-        for i, tok in enumerate(tokens):
-            accumulated += tok
-            if completion.startswith(accumulated.lstrip()):
-                return i
-        return len(tokens)
+        return ScoringResponse(
+            completion=completion,
+            logprobs=lps,
+            raw=response.raw,
+        )
 
     def tokenize(
         self,
@@ -192,34 +195,31 @@ class LlamaCppBackend(LLMBackend):
         *,
         context: Optional[str] = None,
     ) -> List[Token]:
-        """Tokenize text using llama.cpp's tokenize endpoint.
+        """Tokenize text via empirical forced generation.
 
-        llama-server provides a ``/tokenize`` endpoint.
+        Forces ``text`` as the only valid label in a GBNF grammar constrained
+        :meth:`chat` call and reads back the emitted value tokens. This is
+        necessary because standalone BPE tokenization (via ``/tokenize``)
+        produces different token boundaries than the model emits under grammar
+        guidance, which would break trie-based divergence scoring. Results are
+        memoized per label.
         """
-        full_text = (context or "") + text
-        url = f"{self._base_url}/tokenize"
-        body = {"content": full_text}
-        with httpx.Client(timeout=self._timeout) as client:
-            resp = client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            data = resp.json()
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached
 
-        tokens_data: list = data.get("tokens", [])
-        if context:
-            ctx_body = {"content": context}
-            with httpx.Client(timeout=self._timeout) as client:
-                ctx_resp = client.post(url, headers=self._build_headers(), json=ctx_body)
-                ctx_resp.raise_for_status()
-                ctx_data = ctx_resp.json()
-            tokens_data = tokens_data[len(ctx_data.get("tokens", [])):]
-
-        return [
-            Token(
-                text=t if isinstance(t, str) else "",
-                id=t if isinstance(t, int) else -1,
-            )
-            for t in tokens_data
-        ]
+        response = self.chat(
+            messages=[ChatMessage(role="user", content=text)],
+            temperature=0.0,
+            constrain_labels=[text],
+            logprobs=True,
+            top_logprobs=1,
+        )
+        lps = self._label_token_logprobs(response.logprobs or [])
+        tokens = [Token(text=lp.token, id=-1) for lp in lps]
+        tokens = tokens or [Token(text=text, id=-1)]
+        self._token_cache[text] = tokens
+        return tokens
 
     # ------------------------------------------------------------------
     # Async
@@ -243,56 +243,39 @@ class LlamaCppBackend(LLMBackend):
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            result = self._parse_chat_response(resp.json())
-            result.label = result.content.strip()
-            return result
+        client = await self._get_async_http()
+        resp = await client.post(url, headers=self._build_headers(), json=body)
+        resp.raise_for_status()
+        result = self._parse_chat_response(resp.json())
+        result.label = result.content.strip()
+        return result
 
     async def ascore(
         self,
         messages: List[ChatMessage],
         completion: str,
     ) -> ScoringResponse:
-        """Async completion scoring via llama.cpp server."""
-        prompt = self._render_prompt(messages)
-        url = f"{self._base_url}/completions"
-        body: Dict[str, Any] = {
-            "model": self._model,
-            "prompt": prompt,
-            "suffix": completion,
-            "max_tokens": 0,
-            "temperature": 0.0,
-            "logprobs": 1,
-            "echo": True,
-            **self._extra_body,
-        }
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            data = resp.json()
+        """Async completion scoring via forced constrained generation.
 
-        choice = data["choices"][0]
-        all_logprobs = choice.get("logprobs", {})
-        tokens_list = all_logprobs.get("tokens", [])
-        token_lps_list = all_logprobs.get("token_logprobs", [])
-        top_lps_list = all_logprobs.get("top_logprobs", [])
-
-        completion_start = self._find_completion_start(tokens_list, completion)
-
-        token_logprobs: list[TokenLogprob] = []
-        for i in range(completion_start, len(tokens_list)):
-            top: dict[str, float] = {}
-            if i < len(top_lps_list) and top_lps_list[i]:
-                for t, lp in top_lps_list[i].items():
-                    top[t] = lp
-            lp = token_lps_list[i] if i < len(token_lps_list) else 0.0
-            token_logprobs.append(
-                TokenLogprob(token=tokens_list[i], logprob=lp or 0.0, top_logprobs=top)
+        See :meth:`score` for the rationale.
+        """
+        response = await self.achat(
+            messages=messages,
+            temperature=0.0,
+            constrain_labels=[completion],
+            logprobs=True,
+            top_logprobs=1,
+        )
+        lps = self._label_token_logprobs(response.logprobs or [])
+        if not lps:
+            raise RuntimeError(
+                f"ascore({completion!r}): forced generation returned no value tokens"
             )
-
-        return ScoringResponse(completion=completion, logprobs=token_logprobs, raw=data)
+        return ScoringResponse(
+            completion=completion,
+            logprobs=lps,
+            raw=response.raw,
+        )
 
     async def atokenize(
         self,
@@ -300,28 +283,24 @@ class LlamaCppBackend(LLMBackend):
         *,
         context: Optional[str] = None,
     ) -> List[Token]:
-        """Async tokenization via llama.cpp server."""
-        full_text = (context or "") + text
-        url = f"{self._base_url}/tokenize"
-        body = {"content": full_text}
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            data = resp.json()
+        """Async empirical tokenization via forced constrained generation.
 
-        tokens_data: list = data.get("tokens", [])
-        if context:
-            ctx_body = {"content": context}
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                ctx_resp = await client.post(url, headers=self._build_headers(), json=ctx_body)
-                ctx_resp.raise_for_status()
-                ctx_data = ctx_resp.json()
-            tokens_data = tokens_data[len(ctx_data.get("tokens", [])):]
+        See :meth:`tokenize` for the rationale. Reuses the sync memoization
+        cache since tokenization is deterministic.
+        """
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached
 
-        return [
-            Token(
-                text=t if isinstance(t, str) else "",
-                id=t if isinstance(t, int) else -1,
-            )
-            for t in tokens_data
-        ]
+        response = await self.achat(
+            messages=[ChatMessage(role="user", content=text)],
+            temperature=0.0,
+            constrain_labels=[text],
+            logprobs=True,
+            top_logprobs=1,
+        )
+        lps = self._label_token_logprobs(response.logprobs or [])
+        tokens = [Token(text=lp.token, id=-1) for lp in lps]
+        tokens = tokens or [Token(text=text, id=-1)]
+        self._token_cache[text] = tokens
+        return tokens

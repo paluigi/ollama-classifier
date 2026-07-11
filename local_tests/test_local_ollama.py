@@ -290,3 +290,19 @@ class TestBatch:
             print(f"\n[batch_generate] {text!r}")
             print(f"  -> {result.prediction} ({result.confidence:.2%})")
             _assert_valid(result, choices, "adaptive_generate")
+
+
+# ===========================================================================
+# Dataset evaluation -- classify + generate on dataset_runner.py, save CSV
+# ===========================================================================
+
+class TestDataset:
+    def test_dataset_classify_and_generate(self, classifier: LLMClassifier) -> None:
+        """Run the full dataset through classify() and generate(), save CSV."""
+        from local_tests.dataset_runner import run_dataset_and_save_csv
+
+        run_dataset_and_save_csv(
+            classifier=classifier,
+            backend_name="ollama",
+            llm_name=MODEL,
+        )

@@ -2,25 +2,36 @@
 
 Supports both local and remote vLLM servers via the OpenAI-compatible API.
 
-vLLM supports ``guided_choice`` natively, which constrains the model to
-generate exactly one of the provided label strings — **bare label text**
-with no JSON wrapper. This makes logprob reconstruction clean and exact.
+Constraint mechanism: ``structured_outputs.choice`` — vLLM v0.12.0+ replaced
+the deprecated ``guided_choice`` with ``structured_outputs.choice``, which
+constrains the model to generate exactly one of the provided label strings as
+**bare label text** with no JSON wrapper.
+
+**Scoring approach:** ``score()`` uses the ``/v1/completions`` endpoint with
+``echo=True`` to recover the model's genuine per-label logprobs via prefill
+(no constraint, no generation). This produces differentiated confidence scores
+for ``classify()`` because the label is evaluated as an unexpected continuation
+of the prompt, not forced by a constraint.
+
+**Tokenization approach:** ``tokenize()`` uses empirical **forced constrained
+generation** (forcing the label as the only valid ``choice``). This is
+necessary because standalone BPE tokenization produces different token
+boundaries than the model emits under constraint guidance, which would break
+trie-based divergence scoring in ``generate()``.
 
 Local server::
 
-    python -m vllm.entrypoints.openai.api_server \\
-        --model meta-llama/Llama-3.2-3B-Instruct \\
+    vllm serve Qwen/Qwen2.5-3B-Instruct \\
         --host 0.0.0.0 --port 8000
 
 Connect::
 
     backend = VLLMBackend(
-        model="meta-llama/Llama-3.2-3B-Instruct",
+        model="Qwen/Qwen2.5-3B-Instruct",
         base_url="http://localhost:8000/v1",
     )
 """
 
-import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -32,10 +43,29 @@ class VLLMBackend(LLMBackend):
     """Backend for vLLM inference server.
 
     vLLM provides a high-throughput serving engine with an OpenAI-compatible
-    API endpoint. It supports guided decoding (``guided_choice``) and logprob
-    return out of the box. Logprobs are pre-mask (raw model logits before
-    guided decoding masking).
+    API endpoint. It supports ``structured_outputs.choice`` for bare-label
+    constrained generation and logprob return out of the box. Logprobs are
+    pre-mask (raw model logits before constraint masking).
+
+    ``score()`` uses echo/prefill (``/v1/completions`` with ``echo=True``) so
+    that ``classify()`` produces differentiated confidence. ``tokenize()``
+    uses forced constrained generation (``structured_outputs.choice``) so the
+    token strings used for trie construction match the actual
+    constrained-generation token boundaries.
     """
+
+    # End-of-sequence / special tokens to filter from constrained responses
+    _SPECIAL_TOKENS = frozenset(
+        {
+            "<|im_end|>",
+            "<|endoftext|>",
+            "</s>",
+            "<|end_of_turn|>",
+            "<|eot_id|>",
+            "<|end|>",
+            "<|eom_id|>",
+        }
+    )
 
     def __init__(
         self,
@@ -55,15 +85,89 @@ class VLLMBackend(LLMBackend):
             max_tokens=max_tokens,
             extra_body=extra_body,
         )
+        self._token_cache: dict[str, list[Token]] = {}
+        self._sync_http: httpx.Client | None = None
+        self._async_http: httpx.AsyncClient | None = None
 
     @property
     def supports_bare_label_constraint(self) -> bool:
-        """True — vLLM ``guided_choice`` generates bare label text."""
+        """True -- vLLM ``structured_outputs.choice`` generates bare label text."""
         return True
 
+    @property
+    def _server_url(self) -> str:
+        """Base server URL without the ``/v1`` prefix (for ``/tokenize``)."""
+        return self._base_url.rstrip("/").removesuffix("/v1")
+
+    def _get_sync_http(self) -> httpx.Client:
+        """Return a pooled sync HTTP client (created lazily)."""
+        if self._sync_http is None:
+            self._sync_http = httpx.Client(timeout=self._timeout)
+        return self._sync_http
+
+    async def _get_async_http(self) -> httpx.AsyncClient:
+        """Return a pooled async HTTP client (created lazily)."""
+        if self._async_http is None:
+            self._async_http = httpx.AsyncClient(timeout=self._timeout)
+        return self._async_http
+
     def _apply_constraint(self, body: Dict[str, Any], labels: List[str]) -> None:
-        """Apply ``guided_choice`` constraint (vLLM native)."""
-        body["guided_choice"] = labels
+        """Apply ``structured_outputs.choice`` constraint (vLLM v0.12.0+).
+
+        Replaces the deprecated ``guided_choice`` parameter.
+        """
+        body["structured_outputs"] = {"choice": labels}
+
+    @staticmethod
+    def _label_token_logprobs(
+        logprobs: List[TokenLogprob],
+    ) -> List[TokenLogprob]:
+        """Extract label tokens from a bare-label constrained response.
+
+        For vLLM (bare-label backend), this filters out special /
+        end-of-sequence tokens. The ``structured_outputs.choice`` constraint
+        guarantees only the label text is generated, so no JSON-structure
+        filtering is needed.
+        """
+        return [
+            lp
+            for lp in logprobs
+            if lp.token.strip() and lp.token not in VLLMBackend._SPECIAL_TOKENS
+        ]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _render_prompt(self, messages: List[ChatMessage]) -> str:
+        """Render messages to a plain text prompt for the completions endpoint."""
+        parts: list[str] = []
+        for m in messages:
+            if m.role == "system":
+                parts.append(f"<|system|>\n{m.content}")
+            elif m.role == "user":
+                parts.append(f"<|user|>\n{m.content}")
+        return "\n\n".join(parts) + "\n\n<|assistant|>\n"
+
+    def _tokenize_count(self, text: str) -> int:
+        """Count tokens via the ``/tokenize`` endpoint (non-``/v1``).
+
+        Raises on HTTP errors -- no silent masking.
+        """
+        url = f"{self._server_url}/tokenize"
+        body = {"model": self._model, "prompt": text}
+        resp = self._get_sync_http().post(url, headers=self._build_headers(), json=body)
+        resp.raise_for_status()
+        return resp.json().get("count", 0)
+
+    async def _atokenize_count(self, text: str) -> int:
+        """Async token count via the ``/tokenize`` endpoint."""
+        url = f"{self._server_url}/tokenize"
+        body = {"model": self._model, "prompt": text}
+        client = await self._get_async_http()
+        resp = await client.post(url, headers=self._build_headers(), json=body)
+        resp.raise_for_status()
+        return resp.json().get("count", 0)
 
     # ------------------------------------------------------------------
     # Sync
@@ -87,61 +191,68 @@ class VLLMBackend(LLMBackend):
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
-        with httpx.Client(timeout=self._timeout) as client:
-            resp = client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            result = self._parse_chat_response(resp.json())
-            # vLLM guided_choice returns bare label text
-            result.label = result.content.strip()
-            return result
+        resp = self._get_sync_http().post(url, headers=self._build_headers(), json=body)
+        resp.raise_for_status()
+        result = self._parse_chat_response(resp.json())
+        result.label = result.content.strip()
+        return result
 
     def score(
         self,
         messages: List[ChatMessage],
         completion: str,
     ) -> ScoringResponse:
-        """Score a completion using vLLM's completions endpoint.
+        """Score a completion using echo/prefill logprobs (no constraint).
 
-        Uses ``/v1/completions`` with ``prompt_logprobs`` to compute the
-        per-token logprobs of the completion given the prompt context.
+        Uses ``/v1/completions`` with ``echo=True`` to recover the model's
+        genuine per-token logprobs for the label as an unexpected continuation
+        of the prompt. The ``/tokenize`` endpoint pinpoints the exact
+        label-token boundary. The spurious ``max_tokens=1`` generated token
+        is discarded by slicing to ``total_len``.
         """
         prompt = self._render_prompt(messages)
+        prompt_with_completion = prompt + completion
+
+        prompt_len = self._tokenize_count(prompt)
+        total_len = self._tokenize_count(prompt_with_completion)
+
         url = f"{self._base_url}/completions"
         body: Dict[str, Any] = {
             "model": self._model,
-            "prompt": prompt + completion,
+            "prompt": prompt_with_completion,
             "echo": True,
             "max_tokens": 1,
             "temperature": 0.0,
-            "logprobs": 0,
+            "logprobs": 1,
             **self._extra_body,
         }
-        with httpx.Client(timeout=self._timeout) as client:
-            resp = client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            data = resp.json()
+        resp = self._get_sync_http().post(url, headers=self._build_headers(), json=body)
+        resp.raise_for_status()
+        data = resp.json()
 
-        # Extract logprobs only for the completion tokens (skip prompt tokens)
         choice = data["choices"][0]
-        all_logprobs = choice.get("logprobs", [])
-        prompt_token_count = len(self._tokenize_ids(prompt))
-        completion_lps = all_logprobs[prompt_token_count:]
+        all_logprobs = choice.get("logprobs", {})
+        tokens_list = all_logprobs.get("tokens", [])
+        token_lps_list = all_logprobs.get("token_logprobs", [])
+        top_lps_list = all_logprobs.get("top_logprobs", [])
+
+        completion_tokens = tokens_list[prompt_len:total_len]
+        completion_lps = token_lps_list[prompt_len:total_len]
+        completion_top = top_lps_list[prompt_len:total_len]
 
         token_logprobs: list[TokenLogprob] = []
-        for lp_entry in completion_lps:
-            if lp_entry is None:
-                continue
+        for i, tok in enumerate(completion_tokens):
             top: dict[str, float] = {}
-            for alt in lp_entry.get("top_logprobs", []):
-                top[alt["token"]] = alt["logprob"]
-            token_logprobs.append(
-                TokenLogprob(
-                    token=lp_entry.get("tokens", ""),
-                    logprob=lp_entry.get("token_logprobs", 0.0),
-                    top_logprobs=top,
-                )
-            )
+            if i < len(completion_top) and completion_top[i]:
+                for t, lp in completion_top[i].items():
+                    top[t] = lp
+            lp = completion_lps[i] if i < len(completion_lps) else 0.0
+            token_logprobs.append(TokenLogprob(token=tok, logprob=lp or 0.0, top_logprobs=top))
 
+        if not token_logprobs:
+            raise RuntimeError(
+                f"score({completion!r}): echo returned no label tokens"
+            )
         return ScoringResponse(completion=completion, logprobs=token_logprobs, raw=data)
 
     def tokenize(
@@ -150,51 +261,31 @@ class VLLMBackend(LLMBackend):
         *,
         context: Optional[str] = None,
     ) -> List[Token]:
-        """Tokenize text using vLLM's tokenize endpoint.
+        """Tokenize text via empirical forced generation.
 
-        vLLM provides a ``/tokenize`` endpoint (non-standard but supported
-        in recent versions).
+        Forces ``text`` as the only valid choice in a
+        ``structured_outputs.choice`` constrained :meth:`chat` call and reads
+        back the emitted value tokens. This is necessary because standalone
+        BPE tokenization (via ``/tokenize``) produces different token
+        boundaries than the model emits under constraint guidance, which would
+        break trie-based divergence scoring. Results are memoized per label.
         """
-        full_text = (context or "") + text
-        url = f"{self._base_url}/tokenize"
-        body = {"model": self._model, "prompt": full_text}
-        with httpx.Client(timeout=self._timeout) as client:
-            resp = client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            data = resp.json()
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached
 
-        token_ids: list[int] = data.get("tokens", [])
-        if context:
-            ctx_body = {"model": self._model, "prompt": context}
-            with httpx.Client(timeout=self._timeout) as client:
-                ctx_resp = client.post(url, headers=self._build_headers(), json=ctx_body)
-                ctx_resp.raise_for_status()
-                ctx_data = ctx_resp.json()
-            token_ids = token_ids[len(ctx_data.get("tokens", [])):]
-
-        return [Token(text="", id=t) for t in token_ids]
-
-    def _tokenize_ids(self, text: str) -> list[int]:
-        """Return token IDs for text (used for prompt/completion boundary)."""
-        try:
-            url = f"{self._base_url}/tokenize"
-            body = {"model": self._model, "prompt": text}
-            with httpx.Client(timeout=self._timeout) as client:
-                resp = client.post(url, headers=self._build_headers(), json=body)
-                resp.raise_for_status()
-                return resp.json().get("tokens", [])
-        except Exception:
-            return []
-
-    def _render_prompt(self, messages: List[ChatMessage]) -> str:
-        """Render messages to a plain text prompt for the completions endpoint."""
-        parts: list[str] = []
-        for m in messages:
-            if m.role == "system":
-                parts.append(f"<|system|>\n{m.content}")
-            elif m.role == "user":
-                parts.append(f"<|user|>\n{m.content}")
-        return "\n\n".join(parts) + "\n\n<|assistant|>\n"
+        response = self.chat(
+            messages=[ChatMessage(role="user", content=text)],
+            temperature=0.0,
+            constrain_labels=[text],
+            logprobs=True,
+            top_logprobs=1,
+        )
+        lps = self._label_token_logprobs(response.logprobs or [])
+        tokens = [Token(text=lp.token, id=-1) for lp in lps]
+        tokens = tokens or [Token(text=text, id=-1)]
+        self._token_cache[text] = tokens
+        return tokens
 
     # ------------------------------------------------------------------
     # Async
@@ -218,55 +309,66 @@ class VLLMBackend(LLMBackend):
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            result = self._parse_chat_response(resp.json())
-            result.label = result.content.strip()
-            return result
+        client = await self._get_async_http()
+        resp = await client.post(url, headers=self._build_headers(), json=body)
+        resp.raise_for_status()
+        result = self._parse_chat_response(resp.json())
+        result.label = result.content.strip()
+        return result
 
     async def ascore(
         self,
         messages: List[ChatMessage],
         completion: str,
     ) -> ScoringResponse:
-        """Async completion scoring via vLLM."""
+        """Async completion scoring via echo/prefill logprobs.
+
+        See :meth:`score` for the rationale.
+        """
         prompt = self._render_prompt(messages)
+        prompt_with_completion = prompt + completion
+
+        prompt_len = await self._atokenize_count(prompt)
+        total_len = await self._atokenize_count(prompt_with_completion)
+
         url = f"{self._base_url}/completions"
         body: Dict[str, Any] = {
             "model": self._model,
-            "prompt": prompt + completion,
+            "prompt": prompt_with_completion,
             "echo": True,
             "max_tokens": 1,
             "temperature": 0.0,
-            "logprobs": 0,
+            "logprobs": 1,
             **self._extra_body,
         }
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            data = resp.json()
+        client = await self._get_async_http()
+        resp = await client.post(url, headers=self._build_headers(), json=body)
+        resp.raise_for_status()
+        data = resp.json()
 
         choice = data["choices"][0]
-        all_logprobs = choice.get("logprobs", [])
-        prompt_token_count = len(self._tokenize_ids(prompt))
-        completion_lps = all_logprobs[prompt_token_count:]
+        all_logprobs = choice.get("logprobs", {})
+        tokens_list = all_logprobs.get("tokens", [])
+        token_lps_list = all_logprobs.get("token_logprobs", [])
+        top_lps_list = all_logprobs.get("top_logprobs", [])
+
+        completion_tokens = tokens_list[prompt_len:total_len]
+        completion_lps = token_lps_list[prompt_len:total_len]
+        completion_top = top_lps_list[prompt_len:total_len]
 
         token_logprobs: list[TokenLogprob] = []
-        for lp_entry in completion_lps:
-            if lp_entry is None:
-                continue
+        for i, tok in enumerate(completion_tokens):
             top: dict[str, float] = {}
-            for alt in lp_entry.get("top_logprobs", []):
-                top[alt["token"]] = alt["logprob"]
-            token_logprobs.append(
-                TokenLogprob(
-                    token=lp_entry.get("tokens", ""),
-                    logprob=lp_entry.get("token_logprobs", 0.0),
-                    top_logprobs=top,
-                )
-            )
+            if i < len(completion_top) and completion_top[i]:
+                for t, lp in completion_top[i].items():
+                    top[t] = lp
+            lp = completion_lps[i] if i < len(completion_lps) else 0.0
+            token_logprobs.append(TokenLogprob(token=tok, logprob=lp or 0.0, top_logprobs=top))
 
+        if not token_logprobs:
+            raise RuntimeError(
+                f"ascore({completion!r}): echo returned no label tokens"
+            )
         return ScoringResponse(completion=completion, logprobs=token_logprobs, raw=data)
 
     async def atokenize(
@@ -275,22 +377,24 @@ class VLLMBackend(LLMBackend):
         *,
         context: Optional[str] = None,
     ) -> List[Token]:
-        """Async tokenization via vLLM."""
-        full_text = (context or "") + text
-        url = f"{self._base_url}/tokenize"
-        body = {"model": self._model, "prompt": full_text}
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, headers=self._build_headers(), json=body)
-            resp.raise_for_status()
-            data = resp.json()
+        """Async empirical tokenization via forced constrained generation.
 
-        token_ids: list[int] = data.get("tokens", [])
-        if context:
-            ctx_body = {"model": self._model, "prompt": context}
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                ctx_resp = await client.post(url, headers=self._build_headers(), json=ctx_body)
-                ctx_resp.raise_for_status()
-                ctx_data = ctx_resp.json()
-            token_ids = token_ids[len(ctx_data.get("tokens", [])):]
+        See :meth:`tokenize` for the rationale. Reuses the sync memoization
+        cache since tokenization is deterministic.
+        """
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached
 
-        return [Token(text="", id=t) for t in token_ids]
+        response = await self.achat(
+            messages=[ChatMessage(role="user", content=text)],
+            temperature=0.0,
+            constrain_labels=[text],
+            logprobs=True,
+            top_logprobs=1,
+        )
+        lps = self._label_token_logprobs(response.logprobs or [])
+        tokens = [Token(text=lp.token, id=-1) for lp in lps]
+        tokens = tokens or [Token(text=text, id=-1)]
+        self._token_cache[text] = tokens
+        return tokens

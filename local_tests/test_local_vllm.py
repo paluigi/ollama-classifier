@@ -1,34 +1,32 @@
-"""LOCAL-ONLY integration tests against a real SGLang server.
+"""LOCAL-ONLY integration tests against a real vLLM server.
 
 This file lives under ``local_tests/`` and is NOT part of the CI test suite
 (pytest's ``testpaths`` only collects from ``tests/``). It exercises a running
-local SGLang instance and the ``Qwen2.5-3B-Instruct-GGUF`` model through
-both scoring methods of :class:`LLMClassifier`:
+local vLLM instance and the ``Qwen/Qwen2.5-3B-Instruct`` model through both
+scoring methods of :class:`LLMClassifier`:
 
 * ``classify()``  -- exact multi-call completion scoring (``method="multi_call"``)
 * ``generate()``  -- adaptive constrained generation (``method="adaptive_generate"``)
 
 Prerequisites
 -------------
-1. SGLang server running on port 30000 with the GGUF model:
+1. vLLM server running on port 30002 with the model loaded:
 
-    docker compose up  # uses the sglang-qwen-gguf service
+    docker compose up  # uses the vllm-server service
 
-   The server loads ``qwen2.5-3b-instruct-q4_k_m.gguf`` with
-   ``--load-format gguf`` and ``--tokenizer-path Qwen/Qwen2.5-3B-Instruct``.
+   Or directly::
 
-2. The model loaded and reachable at ``http://localhost:30000/v1``.
+    vllm serve Qwen/Qwen2.5-3B-Instruct --host 0.0.0.0 --port 30002
+
+2. The model loaded and reachable at ``http://localhost:30002/v1``.
 
 Run with::
 
-    uv run python -m pytest local_tests/test_local_sglang.py -s
+    uv run python -m pytest local_tests/test_local_vllm.py -s
 
 The ``-s`` flag disables output capture so the per-test prints are visible.
-The whole module is skipped automatically if SGLang is unreachable or the
+The whole module is skipped automatically if vLLM is unreachable or the
 model is not present, so importing it elsewhere never hard-fails.
-
-Note: SGLang's first request after a cold start can take ~15s while the model
-loads, so the skip guards use generous timeouts.
 """
 
 from __future__ import annotations
@@ -41,11 +39,11 @@ from urllib.request import Request, urlopen
 import pytest
 
 from ollama_classifier import ClassificationResult, LLMClassifier
-from ollama_classifier.backends import SGLangBackend
+from ollama_classifier.backends import VLLMBackend
 
-MODEL = "Qwen2.5-3B-Instruct-GGUF"
+MODEL = "Qwen/Qwen2.5-3B-Instruct"
 HOST = "localhost"
-PORT = 30000
+PORT = 30002
 BASE_URL = f"http://{HOST}:{PORT}/v1"
 
 
@@ -61,13 +59,8 @@ def _port_open(host: str = HOST, port: int = PORT, timeout: float = 2.0) -> bool
         return False
 
 
-def _model_present(host: str = HOST, port: int = PORT) -> bool:
-    """Check the SGLang OpenAI-compatible ``/v1/models`` endpoint for the model.
-
-    SGLang reports the full filesystem path as the model ID (e.g. the GGUF
-    file path). Match by substring so the short ``MODEL`` display name used in
-    API requests doesn't need to match the path exactly.
-    """
+def _model_present(model: str = MODEL, host: str = HOST, port: int = PORT) -> bool:
+    """Check the vLLM OpenAI-compatible ``/v1/models`` endpoint for the model."""
     try:
         req = Request(f"http://{host}:{port}/v1/models")
         with urlopen(req, timeout=20.0) as resp:
@@ -75,17 +68,14 @@ def _model_present(host: str = HOST, port: int = PORT) -> bool:
     except (URLError, OSError, ValueError):
         return False
     ids = {m.get("id", "") for m in data.get("data", [])}
-    return any(
-        "qwen2.5-3b-instruct" in mid.lower() and "gguf" in mid.lower()
-        for mid in ids
-    )
+    return any(model in mid for mid in ids)
 
 
 _skip_no_server = pytest.mark.skipif(
-    not _port_open(), reason=f"SGLang server not reachable at {HOST}:{PORT}"
+    not _port_open(), reason=f"vLLM server not reachable at {HOST}:{PORT}"
 )
 _skip_no_model = pytest.mark.skipif(
-    not _model_present(), reason=f"Model '{MODEL}' not found on the SGLang server"
+    not _model_present(), reason=f"Model '{MODEL}' not found on the vLLM server"
 )
 
 pytestmark = [_skip_no_server, _skip_no_model]
@@ -97,13 +87,12 @@ pytestmark = [_skip_no_server, _skip_no_model]
 
 @pytest.fixture
 def classifier() -> LLMClassifier:
-    """Build an ``LLMClassifier`` backed by the local SGLang server.
+    """Build an ``LLMClassifier`` backed by the local vLLM server.
 
-    Function-scoped to mirror the Ollama test file (each async test gets its
-    own event loop under ``asyncio_mode=auto``). SGLang keeps the model warm
-    in memory regardless of the client instance.
+    Function-scoped to mirror the other backend test files (each async test
+    gets its own event loop under ``asyncio_mode=auto``).
     """
-    backend = SGLangBackend(model=MODEL, base_url=BASE_URL)
+    backend = VLLMBackend(model=MODEL, base_url=BASE_URL)
     return LLMClassifier(backend)
 
 
@@ -183,7 +172,6 @@ class TestClassify:
 # ===========================================================================
 # generate() -- adaptive constrained generation (1..max_calls calls)
 # ===========================================================================
-
 
 class TestGenerate:
     def test_generate_single_call_approximate(self, classifier: LLMClassifier) -> None:
@@ -318,6 +306,6 @@ class TestDataset:
 
         run_dataset_and_save_csv(
             classifier=classifier,
-            backend_name="sglang",
+            backend_name="vllm",
             llm_name=MODEL,
         )
