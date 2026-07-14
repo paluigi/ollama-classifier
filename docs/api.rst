@@ -8,8 +8,9 @@ LLMClassifier
 
 The single, unified, backend-agnostic classifier. Accepts any
 :class:`~ollama_classifier.backends.base.LLMBackend` instance and exposes
-two scoring methods: ``generate()`` (adaptive constrained generation) and
-``classify()`` (exact multi-call completion scoring).
+two scoring methods: ``generate()`` (hierarchical constrained generation with
+reproportion-based cluster resolution) and ``classify()`` (exact multi-call
+completion scoring).
 
 .. autoclass:: ollama_classifier.classifier.LLMClassifier
    :members:
@@ -73,13 +74,13 @@ Method Summary
 +----------------------------------------------------+------------------------+----------------------------------------------------------+
 | Method                                             | Async                  | Description                                              |
 +====================================================+========================+==========================================================+
-| ``generate(text, choices, system_prompt, *,        | ``agenerate``          | Adaptive constrained generation (1 to ``max_calls``      |
+| ``generate(text, choices, system_prompt, *,        | ``agenerate``          | Hierarchical constrained generation (1 to ``max_calls``  |
 | max_calls)``                                       |                        | calls). ``method="adaptive_generate"``.                 |
 +----------------------------------------------------+------------------------+----------------------------------------------------------+
 | ``classify(text, choices, system_prompt)``         | ``aclassify``          | Exact multi-call completion scoring (N calls for N       |
 |                                                    |                        | labels). ``method="multi_call"``.                        |
 +----------------------------------------------------+------------------------+----------------------------------------------------------+
-| ``batch_generate(texts, choices, system_prompt,    | ``abatch_generate``    | Batch adaptive generation (parallelized).                |
+| ``batch_generate(texts, choices, system_prompt,    | ``abatch_generate``    | Batch hierarchical generation (parallelized).            |
 | *, max_calls)``                                    |                        |                                                          |
 +----------------------------------------------------+------------------------+----------------------------------------------------------+
 | ``batch_classify(texts, choices, system_prompt)``  | ``abatch_classify``    | Batch multi-call classification (parallelized).          |

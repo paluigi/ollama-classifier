@@ -119,22 +119,22 @@ classifier = LLMClassifier(backend)
 
 | | `generate()` | `classify()` |
 |---|---|---|
-| **How it works** | Adaptive constrained generation over a prefix trie of label tokens. Per-label logprobs are reconstructed from the winning generation path and any unresolved clusters. | Multi-call completion scoring: each label is scored independently as a completion of the prompt. |
+| **How it works** | Hierarchical constrained generation. A single call produces a probability distribution over all labels using divergence-aware logprobs. When `max_calls > 1`, supplementary calls resolve clusters of labels that share a token prefix — but only to *reproportion* probability mass within each cluster, never changing between-group totals. | Multi-call completion scoring: each label is scored independently as a completion of the prompt. |
 | **API calls** | 1 to `max_calls` (adaptive) | N calls for N labels |
 | **Confidence** | Divergence-aware (may be partial for labels that diverge early) | Exact (geometric-mean normalization) |
 | **Approximate?** | `result.approximate` is `True` when any label has partial coverage | Always `False` — fully resolved |
 | **`result.method`** | `"adaptive_generate"` | `"multi_call"` |
 | **Best for** | Speed, large label sets, when a single call suffices | Gold-standard accuracy, small-to-medium label sets |
 
-### `generate()` — adaptive, budget-controlled
+### `generate()` — hierarchical, budget-controlled
 
 The `max_calls` parameter controls the accuracy/cost tradeoff:
 
 | `max_calls` | Behavior | Calls |
 |---|---|---|
-| `1` *(default)* | Single constrained call. Labels are scored up to their divergence point from the winning path. Fast but approximate — set `result.approximate=True`. | 1 |
-| `K` | Adaptive resolution. After each call, unresolved label clusters trigger supplementary constrained calls until the budget is exhausted. | ≤ K |
-| `None` | Fully recursive resolution. Every cluster is resolved to completion. Equivalent to exact scoring. | ≤ N |
+| `1` *(default)* | Single constrained call. Labels are scored up to their divergence point from the winning path. Fast but approximate — sets `result.approximate=True`. | 1 |
+| `K` | Hierarchical resolution. Clusters of ≥2 labels that share a token prefix but diverge from the winner are resolved via supplementary calls. Each call only *reproportions* probability mass within the cluster — between-group totals are locked. Accuracy never degrades. | ≤ K |
+| `None` | Fully recursive resolution. All multi-label clusters are resolved. | ≤ N |
 
 ```python
 # Fast: single call, approximate confidence
