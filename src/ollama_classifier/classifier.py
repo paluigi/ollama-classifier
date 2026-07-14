@@ -3,13 +3,16 @@
 Provides :class:`LLMClassifier`, a backend-agnostic classifier with two
 confidence scoring methods:
 
-- **``generate()``** — Adaptive constrained generation with divergence-aware
-  confidence scoring. Budget-controlled via ``max_calls``. Ranges from 1 call
-  (approximate) to ≤N calls (exact). Uses a prefix trie over label tokens to
-  reconstruct per-label logprobs from constrained generation steps.
+- **``generate()``** — Hierarchical constrained generation.  A single
+  constrained call produces a probability distribution over all labels using
+  divergence-aware logprobs from the winning path.  When ``max_calls > 1``,
+  supplementary calls resolve clusters of labels that share a token prefix
+  but diverge from the winner — but only to **reproportion** probability mass
+  *within* each cluster, never changing the between-group totals.  This
+  guarantees accuracy never degrades as the call budget grows.
 
-- **``classify()``** — Multi-call completion scoring with geometric-mean
-  normalization. Always exact. Makes N calls for N labels (parallelizable
+- **``classify()`` — Multi-call completion scoring with geometric-mean
+  normalization.  Always exact.  Makes N calls for N labels (parallelizable
   via async).
 
 Example::
@@ -66,7 +69,7 @@ class LLMClassifier:
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     # ==================================================================
-    # generate() — Adaptive trie-masked generation
+    # generate() — Hierarchical constrained generation
     # ==================================================================
 
     def generate(
@@ -77,21 +80,39 @@ class LLMClassifier:
         *,
         max_calls: int | None = 1,
     ) -> ClassificationResult:
-        """Adaptive constrained classification with divergence-aware confidence.
+        """Hierarchical constrained classification with divergence-aware confidence.
 
-        Makes 1 to ``max_calls`` constrained API calls. Each call walks a prefix
-        trie of label tokens. After each call, labels are scored up to their
-        divergence point from the winning path. Unresolved clusters trigger
-        supplementary calls (recursive cluster resolution).
+        Makes 1 to ``max_calls`` constrained API calls.
+
+        **Call 1** constrains the model to all labels and returns
+        ``top_logprobs`` at every generated position.  Labels are scored up to
+        their divergence point from the winning path using the geometric mean
+        of available token logprobs, then a softmax produces the initial
+        probability distribution.  All logprobs come from the same constraint
+        context, so the distribution is internally consistent.
+
+        **Calls 2…max_calls** resolve *clusters*: groups of ≥2 non-winning
+        labels that share a scored prefix but diverge from the winner (and from
+        each other) at a later position.  For each cluster, a constrained call
+        over only the cluster's labels produces divergence-based logprobs whose
+        softmax gives **relative weights** summing to 1.  The cluster's total
+        probability mass (summed from the initial distribution) is then
+        redistributed among its members according to these relative weights.
+        This **reproportioning** never changes the total probability of any
+        group — it only sharpens the distribution *within* a group — so
+        accuracy can only improve or stay the same, never degrade.
 
         With ``max_calls=1``: single call, partial scoring (fast, approximate).
-        With ``max_calls=None``: resolves everything recursively (exact).
+        With ``max_calls=None``: resolves all clusters recursively (exact for
+        non-winning labels; equivalent to ``classify()`` when every label is
+        fully resolved).
 
         Args:
             text: Text to classify.
             choices: Labels as list or ``{label: description}`` dict.
             system_prompt: Optional custom system prompt.
             max_calls: Maximum number of API calls. ``None`` = unlimited.
+                ``1`` (default) = single call, no cluster resolution.
 
         Returns:
             ``ClassificationResult`` with ``method="adaptive_generate"``.
@@ -113,23 +134,72 @@ class LLMClassifier:
             trie.insert(label, tokens)
         k = max(trie.max_branching_factor, 5)
 
-        # 3. Adaptive resolution loop
-        all_step_logprobs: dict[str, list[float]] = {
-            label: [] for label in labels
-        }
-        all_scored_lengths: dict[str, int] = {label: 0 for label in labels}
-        calls_made = 0
+        # 3. First constrained call over ALL labels
+        response = self._backend.chat(
+            messages=messages,
+            temperature=0.0,
+            constrain_labels=list(labels),
+            logprobs=True,
+            top_logprobs=k,
+        )
+        calls_made = 1
 
-        # First cluster: all labels
-        frontier: list[Cluster] = [Cluster(labels=list(labels), resolved_length=0)]
+        step_lps = self._extract_step_logprobs(
+            response, token_sequences, list(labels)
+        )
+
+        winning_label = response.label
+        cluster_scores = score_labels_from_winning_path(
+            token_sequences, winning_label, step_lps
+        )
+        cluster_lengths = get_scored_lengths(token_sequences, winning_label)
+
+        # Accumulate per-label logprobs and coverage
+        all_step_logprobs: dict[str, list[float]] = {}
+        all_scored_lengths: dict[str, int] = {}
+        for label in labels:
+            scored_len = cluster_lengths[label]
+            lps: list[float] = []
+            for i in range(scored_len):
+                token = token_sequences[label][i]
+                if i < len(step_lps) and token in step_lps[i]:
+                    lps.append(step_lps[i][token])
+                else:
+                    lps.append(float("-inf"))
+            all_step_logprobs[label] = lps
+            all_scored_lengths[label] = scored_len
+
+        # 4. Initial probability distribution (all from same constraint context)
+        raw_scores: dict[str, float] = {}
+        for label in labels:
+            lps = all_step_logprobs[label]
+            raw_scores[label] = geometric_mean_logprob(lps) if lps else float("-inf")
+
+        probabilities = stable_softmax(raw_scores)
+
+        # 5. Recursive cluster resolution via reproportioning
+        #
+        # Identify clusters of ≥2 labels that share a scored prefix but diverge
+        # from the winner.  For each cluster, make a constrained call over only
+        # the cluster's labels, compute divergence-based relative weights (softmax
+        # of geometric-mean scores), and redistribute the cluster's total
+        # probability mass accordingly.  Between-group probabilities are locked.
+        frontier: list[Cluster] = identify_unresolved_clusters(
+            token_sequences, all_scored_lengths
+        )
 
         while frontier and (max_calls is None or calls_made < max_calls):
-            cluster = frontier.pop(0)  # BFS: breadth-first resolution
+            cluster = frontier.pop(0)
             cluster_labels = cluster.labels
+
+            # Only resolve clusters with ≥2 labels (singletons are already fixed)
+            if len(cluster_labels) < 2:
+                continue
+
             resolved_len = cluster.resolved_length
 
-            # Constrained call over this cluster
-            response = self._backend.chat(
+            # Constrained call over only this cluster's labels
+            cluster_response = self._backend.chat(
                 messages=messages,
                 temperature=0.0,
                 constrain_labels=cluster_labels,
@@ -138,58 +208,65 @@ class LLMClassifier:
             )
             calls_made += 1
 
-            # Extract per-step top_logprobs (filtering structural tokens for Ollama)
-            step_lps = self._extract_step_logprobs(
-                response, token_sequences, cluster_labels
+            cluster_step_lps = self._extract_step_logprobs(
+                cluster_response, token_sequences, cluster_labels
             )
 
-            # Score labels in this cluster up to divergence point
-            winning_label = response.label
-            cluster_token_seqs = {l: token_sequences[l] for l in cluster_labels}
-
-            cluster_scores = score_labels_from_winning_path(
-                cluster_token_seqs, winning_label, step_lps
+            # Score cluster labels from the subset call
+            cluster_winner = cluster_response.label
+            cluster_token_seqs = {
+                l: token_sequences[l] for l in cluster_labels
+            }
+            sub_scores = score_labels_from_winning_path(
+                cluster_token_seqs, cluster_winner, cluster_step_lps
             )
-            cluster_lengths = get_scored_lengths(cluster_token_seqs, winning_label)
+            sub_lengths = get_scored_lengths(
+                cluster_token_seqs, cluster_winner
+            )
 
+            # Update per-label logprobs for cluster members
             for label in cluster_labels:
-                new_len = cluster_lengths[label]
-                if new_len > resolved_len:
-                    # Extract the newly scored token logprobs
+                new_len = sub_lengths[label]
+                if new_len > all_scored_lengths[label]:
                     new_lps: list[float] = []
-                    for i in range(resolved_len, new_len):
+                    for i in range(new_len):
                         token = token_sequences[label][i]
-                        if i < len(step_lps) and token in step_lps[i]:
-                            new_lps.append(step_lps[i][token])
+                        if i < len(cluster_step_lps) and token in cluster_step_lps[i]:
+                            new_lps.append(cluster_step_lps[i][token])
                         else:
                             new_lps.append(float("-inf"))
-                    all_step_logprobs[label].extend(new_lps)
+                    all_step_logprobs[label] = new_lps
                     all_scored_lengths[label] = new_len
 
-            # Identify unresolved sub-clusters within this cluster
+            # Reproportion: redistribute cluster's total probability mass
+            cluster_total = sum(probabilities[l] for l in cluster_labels)
+
+            cluster_raw: dict[str, float] = {}
+            for label in cluster_labels:
+                lps = all_step_logprobs[label]
+                cluster_raw[label] = (
+                    geometric_mean_logprob(lps) if lps else float("-inf")
+                )
+            cluster_weights = stable_softmax(cluster_raw)
+
+            for label in cluster_labels:
+                probabilities[label] = cluster_total * cluster_weights[label]
+
+            # Identify sub-clusters within this cluster for further resolution
             sub_clusters = identify_unresolved_clusters(
-                cluster_token_seqs, cluster_lengths
+                cluster_token_seqs, sub_lengths
             )
             frontier.extend(sub_clusters)
 
-        # 4. Compute final scores from accumulated logprobs
-        raw_scores: dict[str, float] = {}
+        # 6. Compute coverage and final values
         coverage: dict[str, float] = {}
         for label in labels:
-            lps = all_step_logprobs[label]
-            total_tokens = len(token_sequences[label])
-            if lps:
-                raw_scores[label] = geometric_mean_logprob(lps)
-            else:
-                raw_scores[label] = float("-inf")
-            coverage[label] = len(lps) / total_tokens if total_tokens > 0 else 1.0
+            total = len(token_sequences[label])
+            scored = all_scored_lengths[label]
+            coverage[label] = scored / total if total > 0 else 1.0
 
-        # 5. Softmax
-        probabilities = stable_softmax(raw_scores)
-        prediction = max(probabilities, key=probabilities.get)
-
-        # 6. Determine approximation flag
         is_approximate = any(c < 1.0 for c in coverage.values())
+        prediction = max(probabilities, key=probabilities.get)
 
         return ClassificationResult(
             prediction=prediction,
@@ -378,7 +455,10 @@ class LLMClassifier:
         *,
         max_calls: int | None = 1,
     ) -> ClassificationResult:
-        """Async adaptive generation with divergence-aware confidence."""
+        """Async hierarchical constrained generation.
+
+        See :meth:`generate` for the full algorithm description.
+        """
         labels = get_choice_labels(choices)
         system, user = build_classification_prompt(text, choices, system_prompt)
         messages = [
@@ -403,20 +483,62 @@ class LLMClassifier:
             trie.insert(label, tokens)
         k = max(trie.max_branching_factor, 5)
 
-        all_step_logprobs: dict[str, list[float]] = {
-            label: [] for label in labels
-        }
-        all_scored_lengths: dict[str, int] = {label: 0 for label in labels}
-        calls_made = 0
+        # 3. First constrained call over ALL labels
+        response = await self._backend.achat(
+            messages=messages,
+            temperature=0.0,
+            constrain_labels=list(labels),
+            logprobs=True,
+            top_logprobs=k,
+        )
+        calls_made = 1
 
-        frontier: list[Cluster] = [Cluster(labels=list(labels), resolved_length=0)]
+        step_lps = self._extract_step_logprobs(
+            response, token_sequences, list(labels)
+        )
+
+        winning_label = response.label
+        cluster_scores = score_labels_from_winning_path(
+            token_sequences, winning_label, step_lps
+        )
+        cluster_lengths = get_scored_lengths(token_sequences, winning_label)
+
+        # Accumulate per-label logprobs and coverage
+        all_step_logprobs: dict[str, list[float]] = {}
+        all_scored_lengths: dict[str, int] = {}
+        for label in labels:
+            scored_len = cluster_lengths[label]
+            lps: list[float] = []
+            for i in range(scored_len):
+                token = token_sequences[label][i]
+                if i < len(step_lps) and token in step_lps[i]:
+                    lps.append(step_lps[i][token])
+                else:
+                    lps.append(float("-inf"))
+            all_step_logprobs[label] = lps
+            all_scored_lengths[label] = scored_len
+
+        # 4. Initial probability distribution
+        raw_scores: dict[str, float] = {}
+        for label in labels:
+            lps = all_step_logprobs[label]
+            raw_scores[label] = geometric_mean_logprob(lps) if lps else float("-inf")
+
+        probabilities = stable_softmax(raw_scores)
+
+        # 5. Recursive cluster resolution via reproportioning
+        frontier: list[Cluster] = identify_unresolved_clusters(
+            token_sequences, all_scored_lengths
+        )
 
         while frontier and (max_calls is None or calls_made < max_calls):
             cluster = frontier.pop(0)
             cluster_labels = cluster.labels
-            resolved_len = cluster.resolved_length
 
-            response = await self._backend.achat(
+            if len(cluster_labels) < 2:
+                continue
+
+            cluster_response = await self._backend.achat(
                 messages=messages,
                 temperature=0.0,
                 constrain_labels=cluster_labels,
@@ -425,50 +547,62 @@ class LLMClassifier:
             )
             calls_made += 1
 
-            step_lps = self._extract_step_logprobs(
-                response, token_sequences, cluster_labels
+            cluster_step_lps = self._extract_step_logprobs(
+                cluster_response, token_sequences, cluster_labels
             )
 
-            winning_label = response.label
-            cluster_token_seqs = {l: token_sequences[l] for l in cluster_labels}
-
-            cluster_scores = score_labels_from_winning_path(
-                cluster_token_seqs, winning_label, step_lps
+            cluster_winner = cluster_response.label
+            cluster_token_seqs = {
+                l: token_sequences[l] for l in cluster_labels
+            }
+            sub_scores = score_labels_from_winning_path(
+                cluster_token_seqs, cluster_winner, cluster_step_lps
             )
-            cluster_lengths = get_scored_lengths(cluster_token_seqs, winning_label)
+            sub_lengths = get_scored_lengths(
+                cluster_token_seqs, cluster_winner
+            )
 
             for label in cluster_labels:
-                new_len = cluster_lengths[label]
-                if new_len > resolved_len:
+                new_len = sub_lengths[label]
+                if new_len > all_scored_lengths[label]:
                     new_lps: list[float] = []
-                    for i in range(resolved_len, new_len):
+                    for i in range(new_len):
                         token = token_sequences[label][i]
-                        if i < len(step_lps) and token in step_lps[i]:
-                            new_lps.append(step_lps[i][token])
+                        if i < len(cluster_step_lps) and token in cluster_step_lps[i]:
+                            new_lps.append(cluster_step_lps[i][token])
                         else:
                             new_lps.append(float("-inf"))
-                    all_step_logprobs[label].extend(new_lps)
+                    all_step_logprobs[label] = new_lps
                     all_scored_lengths[label] = new_len
 
+            # Reproportion: redistribute cluster's total probability mass
+            cluster_total = sum(probabilities[l] for l in cluster_labels)
+
+            cluster_raw: dict[str, float] = {}
+            for label in cluster_labels:
+                lps = all_step_logprobs[label]
+                cluster_raw[label] = (
+                    geometric_mean_logprob(lps) if lps else float("-inf")
+                )
+            cluster_weights = stable_softmax(cluster_raw)
+
+            for label in cluster_labels:
+                probabilities[label] = cluster_total * cluster_weights[label]
+
             sub_clusters = identify_unresolved_clusters(
-                cluster_token_seqs, cluster_lengths
+                cluster_token_seqs, sub_lengths
             )
             frontier.extend(sub_clusters)
 
-        raw_scores: dict[str, float] = {}
+        # 6. Compute coverage and final values
         coverage: dict[str, float] = {}
         for label in labels:
-            lps = all_step_logprobs[label]
-            total_tokens = len(token_sequences[label])
-            if lps:
-                raw_scores[label] = geometric_mean_logprob(lps)
-            else:
-                raw_scores[label] = float("-inf")
-            coverage[label] = len(lps) / total_tokens if total_tokens > 0 else 1.0
+            total = len(token_sequences[label])
+            scored = all_scored_lengths[label]
+            coverage[label] = scored / total if total > 0 else 1.0
 
-        probabilities = stable_softmax(raw_scores)
-        prediction = max(probabilities, key=probabilities.get)
         is_approximate = any(c < 1.0 for c in coverage.values())
+        prediction = max(probabilities, key=probabilities.get)
 
         return ClassificationResult(
             prediction=prediction,
@@ -481,6 +615,8 @@ class LLMClassifier:
             raw_response={
                 "logprobs": raw_scores,
                 "token_sequences": token_sequences,
+                "step_logprobs": all_step_logprobs,
+                "scored_lengths": all_scored_lengths,
             },
         )
 

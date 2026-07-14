@@ -76,9 +76,13 @@ probability distribution.
 +-------------------+-----------------------------------------------------+-------------------------------------------------------------+
 |                   | ``generate()``                                      | ``classify()``                                              |
 +===================+=====================================================+=============================================================+
-| How it works      | Adaptive constrained generation over a prefix trie  | Multi-call completion scoring: each label scored as a       |
-|                   | of label tokens; per-label logprobs reconstructed   | completion of the prompt (echo/prefill or forced generation).                |
-|                   | from the winning path and unresolved clusters.      |                                                             |
+| How it works      | Hierarchical constrained generation. A single call  | Multi-call completion scoring: each label scored as a       |
+|                   | produces a probability distribution using           | completion of the prompt (echo/prefill or forced generation).|
+|                   | divergence-aware logprobs. When ``max_calls > 1``,  |                                                             |
+|                   | supplementary calls resolve clusters of labels that |                                                             |
+|                   | share a token prefix, *reproportioning* probability |                                                             |
+|                   | mass within each cluster without changing           |                                                             |
+|                   | between-group totals.                               |                                                             |
 +-------------------+-----------------------------------------------------+-------------------------------------------------------------+
 | API calls         | 1 to ``max_calls`` (adaptive)                       | N calls for N labels                                        |
 +-------------------+-----------------------------------------------------+-------------------------------------------------------------+
@@ -94,14 +98,22 @@ probability distribution.
 |                   | suffices                                            |                                                             |
 +-------------------+-----------------------------------------------------+-------------------------------------------------------------+
 
-Adaptive Generation (``generate``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Hierarchical Generation (``generate``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``generate()`` makes 1 to ``max_calls`` constrained API calls. Each call walks
-a prefix trie of label tokens. After each call, labels are scored up to their
-divergence point from the winning path. Unresolved clusters trigger
-supplementary calls (recursive cluster resolution) until the budget is
-exhausted.
+``generate()`` makes 1 to ``max_calls`` constrained API calls. The first call
+constrains the model to all labels and produces a probability distribution using
+divergence-aware logprobs from the winning generation path. All logprobs come
+from the same constraint context, so the distribution is internally consistent.
+
+When ``max_calls > 1``, supplementary calls resolve *clusters*: groups of ≥2
+non-winning labels that share a scored prefix but diverge from the winner. For
+each cluster, a constrained call over only the cluster's labels produces
+divergence-based relative weights (softmax of geometric-mean scores). The
+cluster's total probability mass is then redistributed among its members
+according to these weights. This **reproportioning** never changes the total
+probability of any group — it only sharpens the distribution within a group —
+so accuracy can only improve or stay the same, never degrade.
 
 The ``max_calls`` parameter controls the accuracy/cost tradeoff:
 
@@ -111,11 +123,12 @@ The ``max_calls`` parameter controls the accuracy/cost tradeoff:
 | ``1`` *(default)*   | Single constrained call. Labels are scored up to their    | 1       |
 |                     | divergence point. Fast but approximate.                   |         |
 +---------------------+-----------------------------------------------------------+---------+
-| ``K``               | Adaptive resolution. Unresolved label clusters trigger    | ≤ K     |
-|                     | supplementary calls until the budget is exhausted.        |         |
+| ``K``               | Hierarchical resolution. Clusters of ≥2 labels that       | ≤ K     |
+|                     | share a prefix are resolved via reproportioning.          |         |
+|                     | Accuracy never degrades.                                  |         |
 +---------------------+-----------------------------------------------------------+---------+
-| ``None``            | Fully recursive resolution. Every cluster is resolved to  | ≤ N     |
-|                     | completion. Equivalent to exact scoring.                  |         |
+| ``None``            | Fully recursive resolution. All multi-label clusters      | ≤ N     |
+|                     | are resolved.                                             |         |
 +---------------------+-----------------------------------------------------------+---------+
 
 .. code-block:: python
